@@ -1,0 +1,17 @@
+# Build output
+bin/
+obj/
+
+# IDE
+.vs/
+*.user
+*.suo
+*.userprefs
+
+# Local user data / logs (never commit)
+*.log
+seen.json
+
+# Publish / temp
+publish/
+*.pdb
