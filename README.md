@@ -4,6 +4,16 @@
 
 基于 **.NET Framework 4.8**（WPF + WinForms 托盘），Windows 10/11 开箱即用。
 
+## 📸 截图
+
+| 浅色主界面 | 深色主界面 |
+|---|---|
+| ![main-light](docs/screenshots/main-light.png) | ![main-dark](docs/screenshots/main-dark.png) |
+
+| 账号编辑 | 规则编辑器 | LLM 设置 | LLM 配置 | 验证码通知 |
+|---|---|---|---|---|
+| ![account](docs/screenshots/account-dialog-light.png) | ![rules](docs/screenshots/rules-editor-light.png) | ![llm](docs/screenshots/llm-settings-light.png) | ![llmcfg](docs/screenshots/llm-config-dialog-light.png) | ![toast](docs/screenshots/toast-light.png) |
+
 ## ✨ 功能特性
 
 - **托盘后台常驻**：无主窗口打扰，关闭主界面后继续运行；可选开机自启
