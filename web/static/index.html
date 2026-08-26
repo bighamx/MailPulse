@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MailPulse</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#131a2d; --panel2:#182138; --line:#28344d; --text:#e9edf7; --muted:#9aa7bf; --accent:#62d4a7; --danger:#ff7085; --warn:#ffd166; --blue:#75a9ff; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:linear-gradient(140deg,#080d1a,#101a2f 60%,#0d2522); color:var(--text); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; min-height:100vh; }
+    header { position:sticky; top:0; z-index:10; display:flex; align-items:center; gap:20px; padding:16px 24px; border-bottom:1px solid var(--line); background:#0b1020e6; backdrop-filter:blur(16px); }
+    .brand { display:flex; align-items:center; gap:10px; font-weight:750; font-size:18px; }
+    .logo { width:31px; height:31px; display:grid; place-items:center; border-radius:9px; background:linear-gradient(135deg,var(--accent),#4d9dff); color:#08131d; }
+    nav { display:flex; gap:4px; margin-left:auto; overflow:auto; }
+    nav button { border:0; border-radius:8px; padding:8px 12px; color:var(--muted); background:transparent; cursor:pointer; white-space:nowrap; }
+    nav button.active, nav button:hover { color:var(--text); background:var(--panel2); }
+    main { width:min(1220px,calc(100% - 32px)); margin:24px auto 50px; }
+    section { display:none; }
+    section.active { display:block; animation:fade .18s ease; }
+    @keyframes fade { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
+    .card { border:1px solid var(--line); background:#131a2deb; border-radius:14px; padding:18px; box-shadow:0 12px 35px #0003; }
+    .card h2, .card h3 { margin:0 0 12px; font-size:16px; }
+    .muted { color:var(--muted); }
+    .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .between { justify-content:space-between; }
+    .stat { font-size:28px; font-weight:750; }
+    .tag { display:inline-flex; align-items:center; padding:3px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); font-size:12px; }
+    .tag.ok { color:var(--accent); border-color:#2d7f65; }
+    .tag.error { color:var(--danger); border-color:#91414d; }
+    .tag.warn { color:var(--warn); border-color:#8e7433; }
+    button, input, select, textarea { font:inherit; }
+    button { border:1px solid var(--line); color:var(--text); border-radius:9px; padding:8px 12px; background:var(--panel2); cursor:pointer; }
+    button.primary { border-color:transparent; background:linear-gradient(135deg,var(--accent),#5fb7ff); color:#07131d; font-weight:700; }
+    button.danger { color:var(--danger); }
+    button.ghost { background:transparent; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    input, select, textarea { width:100%; border:1px solid var(--line); border-radius:9px; padding:9px 10px; color:var(--text); background:#0d1424; }
+    textarea { min-height:110px; resize:vertical; font-family:ui-monospace,SFMono-Regular,monospace; }
+    label { display:grid; gap:5px; color:var(--muted); font-size:12px; }
+    .field { display:grid; gap:5px; }
+    .two { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .check { display:flex; align-items:center; gap:8px; color:var(--text); font-size:13px; }
+    .check input { width:17px; height:17px; }
+    .list { display:grid; gap:12px; }
+    .item { border:1px solid var(--line); border-radius:12px; padding:14px; background:#101828; }
+    .event { border-left:3px solid var(--blue); }
+    .event.match { border-left-color:var(--accent); }
+    .event.system { border-left-color:var(--warn); }
+    .mono { font-family:ui-monospace,SFMono-Regular,monospace; }
+    .code { padding:6px 10px; border-radius:8px; background:#0d1728; font-size:22px; letter-spacing:2px; color:var(--accent); }
+    .empty { padding:30px; text-align:center; border:1px dashed var(--line); border-radius:12px; color:var(--muted); }
+    .modal-back { position:fixed; inset:0; z-index:30; display:none; place-items:center; padding:20px; background:#050812cc; }
+    .modal-back.open { display:grid; }
+    .modal { width:min(780px,100%); max-height:88vh; overflow:auto; border:1px solid var(--line); border-radius:16px; background:var(--panel); padding:20px; }
+    .modal h2 { margin:0 0 16px; }
+    .toast { position:fixed; right:20px; bottom:20px; z-index:50; display:grid; gap:8px; }
+    .toast div { border:1px solid var(--line); border-radius:10px; background:#182138f5; padding:11px 14px; box-shadow:0 12px 30px #0005; }
+    pre { white-space:pre-wrap; word-break:break-word; }
+    .pulse { width:8px; height:8px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 5px #62d7a726; }
+    .pulse.off { background:var(--danger); box-shadow:0 0 0 5px #ff708526; }
+    @media (max-width:720px) { header { padding:12px; } .two { grid-template-columns:1fr; } main { margin:16px auto; } }
+  </style>
+</head>
+<body>
+<header>
+  <div class="brand"><div class="logo">✉</div><span>MailPulse</span></div>
+  <div class="row"><span id="servicePulse" class="pulse"></span><span id="serviceStatus" class="muted">连接中…</span></div>
+  <nav>
+    <button data-tab="dashboard" class="active">总览</button>
+    <button data-tab="accounts">邮箱</button>
+    <button data-tab="rules">规则</button>
+    <button data-tab="ai">AI 模型</button>
+    <button data-tab="events">事件</button>
+  </nav>
+</header>
+<main>
+  <section id="dashboard" class="active">
+    <div class="grid">
+      <div class="card"><h2>启用邮箱</h2><div id="statAccounts" class="stat">0</div><div class="muted">后台服务持续轮询 IMAP</div></div>
+      <div class="card"><h2>今日匹配</h2><div id="statMatches" class="stat">0</div><div class="muted">验证码与确认邮件</div></div>
+      <div class="card"><h2>AI 兜底</h2><div id="statAi" class="stat">关闭</div><div id="aiSummary" class="muted">规则优先，未命中才调用模型</div></div>
+      <div class="card"><h2>本地提醒</h2><div class="row"><label class="check"><input id="desktopNotifications" type="checkbox" onchange="saveReminder()">系统通知</label><label class="check"><input id="autoCopyCode" type="checkbox" onchange="saveReminder()">自动复制验证码</label></div><div style="height:12px"></div><button onclick="testNotification()">发送测试通知</button></div>
+      <div class="card"><h2>服务状态</h2><div class="row"><span id="monitorStatus" class="tag">读取中</span><span id="version" class="muted"></span></div><div style="height:10px"></div><button id="reloadService">重载监控配置</button></div>
+    </div>
+  </section>
+  <section id="accounts">
+    <div class="card">
+      <div class="row between"><h2>邮箱账号</h2><button class="primary" onclick="editAccount()">添加邮箱</button></div>
+      <div id="accountList" class="list" style="margin-top:14px"></div>
+    </div>
+  </section>
+  <section id="rules">
+    <div class="card">
+      <div class="row between"><h2>识别规则</h2><button class="primary" onclick="editRule(-1)">添加规则</button></div>
+      <p class="muted">主题关键词或正文正则命中即触发；发件人白名单可选。正则第一个捕获组会作为验证码提取。</p>
+      <div id="ruleList" class="list"></div>
+    </div>
+  </section>
+  <section id="ai">
+    <div class="grid">
+      <div class="card" style="grid-column:1/-1">
+        <div class="row between"><h2>模型策略</h2><span id="activeProviderTag" class="tag"></span></div>
+        <div class="two" style="margin-top:12px">
+          <label>启用 LLM 兜底<select id="llmEnabled"><option value="false">关闭（仅规则）</option><option value="true">开启</option></select></label>
+          <label>当前模型<select id="activeLlm"></select></label>
+        </div>
+        <label style="margin-top:12px">分类提示词<textarea id="llmPrompt"></textarea></label>
+        <div class="row" style="margin-top:12px"><button class="primary" onclick="saveAI()">保存模型策略</button><span class="muted">占位符：{subject}、{body}</span></div>
+      </div>
+      <div class="card" style="grid-column:1/-1">
+        <div class="row between"><h2>模型配置</h2><button class="primary" onclick="editProvider()">添加模型</button></div>
+        <div id="providerList" class="list" style="margin-top:14px"></div>
+      </div>
+      <div class="card" style="grid-column:1/-1">
+        <h2>规则测试</h2>
+        <div class="two">
+          <label>发件人<input id="testFrom" value="noreply@example.com"></label>
+          <label>主题<input id="testSubject" value="Your verification code"></label>
+        </div>
+        <label style="margin-top:10px">正文<textarea id="testBody">Your code is 123456.</textarea></label>
+        <div class="row" style="margin-top:10px"><button onclick="testClassifier()">测试规则</button><pre id="classifierResult" class="muted"></pre></div>
+      </div>
+    </div>
+  </section>
+  <section id="events">
+    <div class="card">
+      <div class="row between"><h2>实时事件</h2><div class="row"><button onclick="clearEvents()">清空</button></div></div>
+      <div id="eventList" class="list" style="margin-top:14px"></div>
+    </div>
+  </section>
+</main>
+<div id="modalBack" class="modal-back"><div id="modal" class="modal"></div></div>
+<div id="toast" class="toast"></div>
+<script>
+let config = null;
+let events = [];
+const presets = { Gmail:['imap.gmail.com',993,995], QQ:['imap.qq.com',993,995], Outlook:['outlook.office365.com',993,995] };
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uuid = () => crypto.randomUUID();
+
+async function api(path, options={}) {
+  const response = await fetch(path, {headers:{'Content-Type':'application/json'},...options});
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  return data;
+}
+function toast(message, error=false) {
+  const node = document.createElement('div');
+  node.textContent = message;
+  if (error) node.style.color = 'var(--danger)';
+  $('#toast').append(node);
+  setTimeout(() => node.remove(), 4200);
+}
+async function refresh() {
+  try {
+    const [health, remoteConfig, remoteEvents] = await Promise.all([api('/api/health'), api('/api/config'), api('/api/events')]);
+    config = remoteConfig; events = remoteEvents.events || [];
+    $('#serviceStatus').textContent = `运行中 · ${health.uptime}`;
+    $('#servicePulse').classList.remove('off');
+    $('#version').textContent = 'v' + health.version;
+    render();
+  } catch (error) {
+    $('#serviceStatus').textContent = '服务未连接';
+    $('#servicePulse').classList.add('off');
+    toast(error.message, true);
+  }
+}
+function render() {
+  renderDashboard(); renderAccounts(); renderRules(); renderAI(); renderEvents();
+}
+function renderDashboard() {
+  const enabled = config.accounts.filter(account => account.enabled).length;
+  const matches = events.filter(event => event.kind === 'match').length;
+  $('#statAccounts').textContent = enabled;
+  $('#statMatches').textContent = matches;
+  const provider = config.llmProviders.find(item => item.id === config.activeLlmId);
+  $('#statAi').textContent = config.llmFallbackEnabled ? '开启' : '关闭';
+  $('#aiSummary').textContent = provider ? `${provider.name} · ${provider.mode === 'local' ? '本地模型' : '云端 API'}` : '未选择模型';
+  const bad = config.accounts.some(account => account.enabled && account.status === 'error');
+  $('#monitorStatus').textContent = bad ? '部分邮箱异常' : '监控正常';
+  $('#monitorStatus').className = 'tag ' + (bad ? 'error' : 'ok');
+  $('#desktopNotifications').checked = config.desktopNotifications;
+  $('#autoCopyCode').checked = config.autoCopyCode;
+}
+function renderAccounts() {
+  const host = $('#accountList');
+  if (!config.accounts.length) { host.innerHTML = '<div class="empty">还没有邮箱账号</div>'; return; }
+  host.innerHTML = config.accounts.map((account, index) => `
+    <div class="item">
+      <div class="row between">
+        <div><strong>${esc(account.name || account.username)}</strong><div class="muted">${esc(account.protocol.toUpperCase())} · ${esc(account.username)} · ${esc(account.host)}</div></div>
+        <span class="tag ${account.enabled ? account.status === 'error' ? 'error' : 'ok' : ''}">${account.enabled ? account.status || 'idle' : '已停用'}</span>
+      </div>
+      ${account.lastError ? `<div class="muted" style="color:var(--danger);margin-top:8px">${esc(account.lastError)}</div>` : ''}
+      <div class="row" style="margin-top:12px">
+        <button onclick="testAccount(${index})">测试连接</button>
+        <button onclick="editAccount(${index})">编辑</button>
+        <button class="danger" onclick="removeAccount(${index})">删除</button>
+      </div>
+    </div>`).join('');
+}
+function renderRules() {
+  const host = $('#ruleList');
+  if (!config.rules.length) { host.innerHTML = '<div class="empty">没有规则</div>'; return; }
+  host.innerHTML = config.rules.map((rule, index) => `
+    <div class="item"><div class="row between"><strong>${esc(rule.name)}</strong><div class="row"><button onclick="editRule(${index})">编辑</button><button class="danger" onclick="removeRule(${index})">删除</button></div></div>
+    <div class="muted" style="margin-top:8px">关键词：${esc(rule.subjectKeywords.join(', ')) || '无'}</div><pre class="muted">${esc(rule.bodyPatterns.join('\n'))}</pre></div>`).join('');
+}
+function renderAI() {
+  $('#llmEnabled').value = String(config.llmFallbackEnabled);
+  $('#llmPrompt').value = config.llmPrompt;
+  $('#activeLlm').innerHTML = config.llmProviders.map(provider => `<option value="${provider.id}">${esc(provider.name)}（${provider.mode === 'local' ? '本地' : 'API'}）</option>`).join('');
+  $('#activeLlm').value = config.activeLlmId;
+  const provider = config.llmProviders.find(item => item.id === config.activeLlmId);
+  $('#activeProviderTag').textContent = provider ? provider.model : '';
+  $('#activeProviderTag').className = 'tag ' + (provider?.status === 'error' ? 'error' : provider?.status === 'ready' || provider?.status === 'ok' ? 'ok' : '');
+  $('#providerList').innerHTML = config.llmProviders.map((provider, index) => `
+    <div class="item"><div class="row between"><div><strong>${esc(provider.name)}</strong><div class="muted">${esc(provider.model)} · ${provider.mode === 'local' ? '本地 ' + esc(provider.runtime) : esc(provider.baseUrl)}</div></div><span class="tag ${provider.status === 'error' ? 'error' : provider.status === 'ready' || provider.status === 'ok' ? 'ok' : provider.status === 'downloading' ? 'warn' : ''}">${esc(provider.status || '未测试')}</span></div>
+    ${provider.lastError ? `<div class="muted" style="color:var(--danger);margin-top:8px">${esc(provider.lastError)}</div>` : ''}
+    <div class="row" style="margin-top:12px">
+      <button onclick="testProvider(${index})">测试模型</button>
+      ${provider.mode === 'local' ? `<button onclick="installProvider(${index})">下载/准备模型</button>` : ''}
+      <button onclick="editProvider(${index})">编辑</button><button class="danger" onclick="removeProvider(${index})">删除</button>
+    </div></div>`).join('') || '<div class="empty">没有模型配置</div>';
+}
+function renderEvents() {
+  const host = $('#eventList');
+  if (!events.length) { host.innerHTML = '<div class="empty">等待邮件事件</div>'; return; }
+  host.innerHTML = [...events].reverse().map(event => `
+    <div class="item event ${esc(event.kind)}"><div class="row between"><strong>${event.kind === 'match' ? esc(event.subject || '匹配邮件') : event.kind === 'system' ? '系统事件' : 'AI 事件'}</strong><span class="muted">${new Date(event.time).toLocaleString()}</span></div>
+    <div class="muted">${esc(event.account || '')} ${esc(event.from || '')}</div>
+    ${event.code ? `<div class="row" style="margin-top:10px"><span class="code">${esc(event.code)}</span><button onclick="copyCode('${esc(event.code)}')">复制</button></div>` : ''}
+    ${event.url ? `<div style="margin-top:8px"><a href="${esc(event.url)}" target="_blank" rel="noopener">${esc(event.url)}</a></div>` : ''}
+    <div class="muted" style="margin-top:8px">${esc(event.reason || event.lastError || '')}</div>
+    ${event.kind === 'match' && event.markAsRead ? `<button class="ghost" style="margin-top:8px" onclick="markRead('${event.id}')">标记已读</button>` : ''}
+    </div>`).join('');
+}
+function editAccount(index=-1) {
+  const account = index >= 0 ? {...config.accounts[index]} : {id:uuid(),name:'',protocol:'imap',host:'',port:993,useSsl:true,username:'',password:'',enabled:true,pollInterval:45,markMatchedAsRead:true,useOauth:false};
+  if (account.password) account.password = '__KEEP__';
+  if (account.refreshToken) account.refreshToken = '__KEEP__';
+  openModal('邮箱账号', `
+    <div class="two"><label>名称<input id="accountName" value="${esc(account.name)}"></label><label>邮箱账号<input id="accountUsername" value="${esc(account.username)}"></label></div>
+    <label style="margin-top:12px">协议<select id="accountProtocol"><option value="imap" ${account.protocol==='imap'?'selected':''}>IMAP（推荐）</option><option value="pop3" ${account.protocol==='pop3'?'selected':''}>POP3</option></select></label>
+    <div class="row" style="margin:12px 0">${Object.keys(presets).map(name => `<button onclick="applyPreset('${name}')">${name}</button>`).join('')}</div>
+    <div class="two"><label>IMAP 服务器<input id="accountHost" value="${esc(account.host)}"></label><label>端口<input id="accountPort" type="number" value="${account.port}"></label></div>
+    <div class="two" style="margin-top:12px"><label>密码 / 授权码<input id="accountPassword" type="password" value="${esc(account.password)}" placeholder="${account.password ? '已保存，留空保持不变' : ''}"></label><label>轮询间隔（秒）<input id="accountInterval" type="number" min="5" value="${account.pollInterval || 45}"></label></div>
+    <div class="two" style="margin-top:12px"><label>OAuth 刷新 Token<input id="accountRefresh" type="password" value="${esc(account.refreshToken || '')}" placeholder="可选"></label><label>OAuth 邮箱地址<input id="oauthEmail" value="${esc(account.oauthUserEmail || '')}"></label></div>
+    <div class="row" style="margin-top:10px"><button id="oauthStart" type="button" onclick="startMicrosoftOAuth()">Microsoft 设备码授权</button><div id="oauthResult" class="muted"></div></div>
+    <div class="row" style="margin-top:12px"><label class="check"><input id="accountEnabled" type="checkbox" ${account.enabled?'checked':''}>启用</label><label class="check"><input id="accountSsl" type="checkbox" ${account.useSsl!==false?'checked':''}>SSL</label><label class="check"><input id="accountRead" type="checkbox" ${account.markMatchedAsRead?'checked':''}>匹配后标记已读</label><label class="check"><input id="accountOauth" type="checkbox" ${account.useOauth?'checked':''}>使用 Microsoft OAuth</label></div>
+  `, async () => {
+    account.name=$('#accountName').value.trim(); account.username=$('#accountUsername').value.trim(); account.protocol=$('#accountProtocol').value; account.host=$('#accountHost').value.trim(); account.port=Number($('#accountPort').value)||(account.protocol==='pop3'?995:993); account.password=$('#accountPassword').value; account.pollInterval=String(Number($('#accountInterval').value)||45)+'s'; account.refreshToken=$('#accountRefresh').value; account.oauthUserEmail=$('#oauthEmail').value.trim(); account.enabled=$('#accountEnabled').checked; account.useSsl=$('#accountSsl').checked; account.markMatchedAsRead=$('#accountRead').checked; account.useOauth=$('#accountOauth').checked;
+    if (account.useOauth) { account.protocol='imap'; account.port=993; }
+    if (index < 0) config.accounts.push(account); else config.accounts[index]=account;
+    await saveConfig(); await testAccount(index < 0 ? config.accounts.length-1 : index, true);
+  });
+}
+function applyPreset(name) { $('#accountHost').value=presets[name][0]; $('#accountPort').value=presets[name][$('#accountProtocol').value==='pop3'?2:1]; }
+let oauthTimer = null;
+async function startMicrosoftOAuth() {
+  try {
+    if (oauthTimer) clearInterval(oauthTimer);
+    $('#oauthResult').textContent = '正在请求设备码…';
+    const login = await api('/api/oauth/microsoft/start', {method:'POST'});
+    $('#oauthResult').innerHTML = `请打开 <a href="${esc(login.verificationUri)}" target="_blank" rel="noopener">${esc(login.verificationUri)}</a> 并输入 <strong>${esc(login.userCode)}</strong>`;
+    oauthTimer = setInterval(async () => {
+      try {
+        const result = await api('/api/oauth/microsoft/exchange', {method:'POST', body:JSON.stringify({deviceCode:login.deviceCode})});
+        if (!result.pending) {
+          clearInterval(oauthTimer); oauthTimer = null;
+          $('#accountRefresh').value = result.refreshToken;
+          $('#accountOauth').checked = true;
+          $('#oauthResult').textContent = '授权成功，保存账号后即可使用';
+          toast('Microsoft 授权成功');
+        }
+      } catch (error) {
+        clearInterval(oauthTimer); oauthTimer = null;
+        $('#oauthResult').textContent = error.message;
+        toast(error.message, true);
+      }
+    }, Math.max(3, login.interval || 5) * 1000);
+  } catch (error) {
+    $('#oauthResult').textContent = error.message;
+    toast('Microsoft 授权启动失败：' + error.message, true);
+  }
+}
+async function testAccount(index, quiet=false) {
+  try { await api('/api/accounts/test',{method:'POST',body:JSON.stringify(config.accounts[index])}); if(!quiet) toast('连接成功'); return true; }
+  catch (error) { toast('连接失败：'+error.message,true); return false; }
+}
+async function removeAccount(index) { if(!confirm('删除该邮箱配置？')) return; config.accounts.splice(index,1); await saveConfig(); }
+function editRule(index=-1) {
+  const rule = index>=0 ? {...config.rules[index],subjectKeywords:[...config.rules[index].subjectKeywords],bodyPatterns:[...config.rules[index].bodyPatterns],senderWhitelist:[...config.rules[index].senderWhitelist]} : {name:'',subjectKeywords:[],bodyPatterns:[],senderWhitelist:[],notifyWithCode:true,notifyWithLink:false};
+  openModal('识别规则', `
+    <label>规则名称<input id="ruleName" value="${esc(rule.name)}"></label>
+    <label style="margin-top:10px">主题关键词（逗号分隔）<textarea id="ruleKeywords" style="min-height:70px">${esc(rule.subjectKeywords.join(','))}</textarea></label>
+    <label style="margin-top:10px">正文正则（每行一个）<textarea id="rulePatterns">${esc(rule.bodyPatterns.join('\n'))}</textarea></label>
+    <label style="margin-top:10px">发件人白名单（逗号分隔）<textarea id="ruleSenders" style="min-height:70px">${esc(rule.senderWhitelist.join(','))}</textarea></label>
+    <div class="row" style="margin-top:12px"><label class="check"><input id="ruleCode" type="checkbox" ${rule.notifyWithCode?'checked':''}>提取验证码</label><label class="check"><input id="ruleLink" type="checkbox" ${rule.notifyWithLink?'checked':''}>提取确认链接</label></div>
+  `, async () => { rule.name=$('#ruleName').value.trim(); rule.subjectKeywords=$('#ruleKeywords').value.split(',').map(x=>x.trim()).filter(Boolean); rule.bodyPatterns=$('#rulePatterns').value.split('\n').map(x=>x.trim()).filter(Boolean); rule.senderWhitelist=$('#ruleSenders').value.split(',').map(x=>x.trim()).filter(Boolean); rule.notifyWithCode=$('#ruleCode').checked; rule.notifyWithLink=$('#ruleLink').checked; if(index<0)config.rules.push(rule);else config.rules[index]=rule; await saveConfig(); });
+}
+async function removeRule(index) { config.rules.splice(index,1); await saveConfig(); }
+function editProvider(index=-1) {
+  const provider = index>=0 ? {...config.llmProviders[index]} : {id:uuid(),name:'Qwen3.5-0.8B',mode:'local',protocol:'openai-chat',runtime:'ollama',baseUrl:'http://127.0.0.1:11434/v1',model:'qwen3.5:0.8b',apiKey:'',timeout:60,enabled:true,autoDownload:true,contextTokens:4096,maxTokens:256,temperature:.1};
+  if (provider.apiKey) provider.apiKey='__KEEP__';
+  openModal('AI 模型', `
+    <div class="two"><label>名称<input id="providerName" value="${esc(provider.name)}"></label><label>模式<select id="providerMode"><option value="local" ${provider.mode==='local'?'selected':''}>本地模型</option><option value="api" ${provider.mode==='api'?'selected':''}>云端 API</option></select></label></div>
+    <div class="two" style="margin-top:12px"><label>协议<select id="providerProtocol"><option value="openai-chat" ${provider.protocol==='openai-chat'?'selected':''}>OpenAI 兼容 Chat</option><option value="anthropic" ${provider.protocol==='anthropic'?'selected':''}>Anthropic</option></select></label><label>本地运行时<select id="providerRuntime"><option value="ollama" ${provider.runtime==='ollama'?'selected':''}>Ollama（内置 Qwen）</option><option value="llama.cpp" ${provider.runtime==='llama.cpp'?'selected':''}>llama.cpp HTTP 服务</option></select></label></div>
+    <div class="two" style="margin-top:12px"><label>Base URL<input id="providerUrl" value="${esc(provider.baseUrl)}"></label><label>模型名<input id="providerModel" value="${esc(provider.model)}"></label></div>
+    <div class="two" style="margin-top:12px"><label>API Key<input id="providerKey" type="password" value="${esc(provider.apiKey)}" placeholder="${provider.apiKey?'已保存，留空保持不变':'本地模型无需填写'}"></label><label>超时（秒）<input id="providerTimeout" type="number" min="5" value="${provider.timeout || 60}"></label></div>
+    <div class="two" style="margin-top:12px"><label>上下文 Token<input id="providerContext" type="number" value="${provider.contextTokens || 4096}"></label><label>输出 Token<input id="providerMax" type="number" value="${provider.maxTokens || 256}"></label></div>
+    <label style="margin-top:10px">Temperature<input id="providerTemp" type="number" step="0.1" min="0" max="2" value="${provider.temperature ?? .1}"></label>
+    <div class="row" style="margin-top:12px"><label class="check"><input id="providerEnabled" type="checkbox" ${provider.enabled?'checked':''}>启用</label><label class="check"><input id="providerDownload" type="checkbox" ${provider.autoDownload?'checked':''}>自动下载本地模型</label></div>
+  `, async()=>{provider.name=$('#providerName').value.trim();provider.mode=$('#providerMode').value;provider.protocol=$('#providerProtocol').value;provider.runtime=$('#providerRuntime').value;provider.baseUrl=$('#providerUrl').value.trim();provider.model=$('#providerModel').value.trim();provider.apiKey=$('#providerKey').value;provider.timeout=String(Number($('#providerTimeout').value)||60)+'s';provider.contextTokens=Number($('#providerContext').value)||4096;provider.maxTokens=Number($('#providerMax').value)||256;provider.temperature=Number($('#providerTemp').value);provider.enabled=$('#providerEnabled').checked;provider.autoDownload=$('#providerDownload').checked;if(index<0)config.llmProviders.push(provider);else config.llmProviders[index]=provider;if(!config.activeLlmId)config.activeLlmId=provider.id;await saveConfig();});
+}
+async function testProvider(index) { try { await api('/api/llm/test',{method:'POST',body:JSON.stringify(config.llmProviders[index])}); toast('模型测试成功'); await refresh(); } catch(error) { toast('模型测试失败：'+error.message,true); await refresh(); } }
+async function installProvider(index) { try { toast('开始准备模型，大模型可能需要数分钟'); await api('/api/llm/install',{method:'POST',body:JSON.stringify(config.llmProviders[index])}); toast('模型已就绪'); await refresh(); } catch(error) { toast('模型准备失败：'+error.message,true); await refresh(); } }
+async function removeProvider(index) { if(!confirm('删除该模型配置？'))return; const removed=config.llmProviders[index]; config.llmProviders.splice(index,1); if(config.activeLlmId===removed?.id)config.activeLlmId=config.llmProviders[0]?.id||''; await saveConfig(); }
+async function saveAI() { config.llmFallbackEnabled=$('#llmEnabled').value==='true'; config.activeLlmId=$('#activeLlm').value; config.llmPrompt=$('#llmPrompt').value; await saveConfig(); }
+async function testClassifier() { const result=await api('/api/classify/test',{method:'POST',body:JSON.stringify({from:$('#testFrom').value,subject:$('#testSubject').value,body:$('#testBody').value})}); $('#classifierResult').textContent=JSON.stringify(result,null,2); }
+async function saveConfig() { try { config=await api('/api/config',{method:'PUT',body:JSON.stringify(config)}); toast('配置已保存'); render(); } catch(error) { toast('保存失败：'+error.message,true); } }
+async function clearEvents() { await api('/api/events',{method:'DELETE'}); events=[]; renderEvents(); }
+async function saveReminder() { config.desktopNotifications=$('#desktopNotifications').checked; config.autoCopyCode=$('#autoCopyCode').checked; await saveConfig(); }
+async function testNotification() { try { await api('/api/notifications/test',{method:'POST'}); toast('测试通知已发送'); }catch(error){toast(error.message,true)} }
+function copyCode(code) { navigator.clipboard.writeText(code).then(()=>toast('已复制')); }
+async function markRead(id) { try { await api(`/api/events/${id}/read`,{method:'POST'}); toast('已加入标记队列'); }catch(error){toast(error.message,true)} }
+function openModal(title, body, save) {
+  $('#modal').innerHTML=`<h2>${esc(title)}</h2>${body}<div class="row" style="justify-content:end;margin-top:18px"><button onclick="closeModal()">取消</button><button class="primary" id="modalSave">保存</button></div>`;
+  $('#modalBack').classList.add('open'); $('#modalSave').onclick=async()=>{ $('#modalSave').disabled=true; try { await save(); closeModal(); } catch(error) { toast(error.message,true); } finally { $('#modalSave').disabled=false; } };
+}
+function closeModal(){ $('#modalBack').classList.remove('open'); if (oauthTimer) clearInterval(oauthTimer); oauthTimer=null; }
+$('#modalBack').onclick=event=>{ if(event.target===event.currentTarget)closeModal(); };
+$$('nav button').forEach(button=>button.onclick=()=>{ $$('nav button').forEach(x=>x.classList.remove('active')); $$('main section').forEach(x=>x.classList.remove('active')); button.classList.add('active'); $('#'+button.dataset.tab).classList.add('active'); });
+$('#reloadService').onclick=()=>saveConfig();
+const stream=new EventSource('/api/stream');
+['match','llm','system'].forEach(kind=>stream.addEventListener(kind,event=>{ const data=JSON.parse(event.data); events.push(data); if(events.length>500)events.shift(); renderDashboard();renderEvents(); if(kind!=='match')toast(data.reason||data.lastError||'服务事件',kind==='system'&&data.level==='error'); }));
+refresh(); setInterval(()=>api('/api/health').catch(()=>{}),30000);
+</script>
+</body>
+</html>
