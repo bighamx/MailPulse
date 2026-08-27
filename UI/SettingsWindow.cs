@@ -78,6 +78,7 @@ namespace MailPulse.UI
                 btnPanel.Children.Add(Theme.CreateButton("删除", DeleteSelected));
                 _btnTest = Theme.CreateButton("测试连接", TestSelected);
                 btnPanel.Children.Add(_btnTest);
+                btnPanel.Children.Add(Theme.CreateButton("邮件中心", () => ((App)Application.Current).ShowMailCenter(), true));
                 Grid.SetRow(btnPanel, 2);
                 root.Children.Add(btnPanel);
 
@@ -92,7 +93,7 @@ namespace MailPulse.UI
                 _chkAutoCopy.Click += (s, e) => { _config.Current.AutoCopyCode = _chkAutoCopy.IsChecked ?? true; _config.Save(); };
 
                 // theme selector
-                var themeLabel = new TextBlock { Text = "外观", Foreground = Theme.TextDimB, VerticalAlignment = VerticalAlignment.Center, FontSize = 12, Margin = new Thickness(0, 0, 6, 0) };
+                var themeLabel = new TextBlock { Text = "外观", Foreground = Theme.TextDimB, VerticalAlignment = VerticalAlignment.Center, FontSize = 12, Margin = new Thickness(20, 0, 6, 0) };
                 _cbTheme = new ComboBox { MinWidth = 90, VerticalAlignment = VerticalAlignment.Center };
                 Theme.StyleComboBox(_cbTheme, 100);
                 _cbTheme.Items.Add("浅色");
@@ -285,37 +286,20 @@ namespace MailPulse.UI
         {
             var acc = SelectedAccount();
             if (acc == null) { MessageBox.Show("请先选中一个账号。"); return; }
-            _btnTest.IsEnabled = false;
+            Theme.SetButtonLoading(_btnTest, true, "测试中…");
+            var app = (App)Application.Current;
+            bool resumeMonitoring = app.TemporarilyStopMonitoring();
             try
             {
-                string result = await Task.Run(() => TestConnect(acc));
-                MessageBox.Show(result, "连接测试");
+                using (var service = new Services.MailCenterService(_config))
+                    await service.LoadInboxAsync(acc, 1, System.Threading.CancellationToken.None);
+                MessageBox.Show("✓ " + acc.Protocol.ToString().ToUpperInvariant() + " 连接与认证成功", "连接测试");
             }
             catch (Exception ex) { MessageBox.Show("测试失败: " + ex.Message, "错误"); }
-            finally { _btnTest.IsEnabled = true; }
-        }
-
-        private static string TestConnect(Models.AccountConfig acc)
-        {
-            if (acc.Protocol == Models.MailProtocol.Imap)
+            finally
             {
-                using (var c = new ImapClient())
-                {
-                    c.Connect(acc.Host, acc.Port, true);
-                    c.Authenticate(acc.User, Services.SecureStore.Unprotect(acc.EncryptedPassword));
-                    c.Disconnect(true);
-                    return "✓ IMAP 连接成功";
-                }
-            }
-            else
-            {
-                using (var c = new Pop3Client())
-                {
-                    c.Connect(acc.Host, acc.Port, true);
-                    c.Authenticate(acc.User, Services.SecureStore.Unprotect(acc.EncryptedPassword));
-                    c.Disconnect(true);
-                    return "✓ POP3 连接成功";
-                }
+                Theme.SetButtonLoading(_btnTest, false);
+                app.ResumeMonitoring(resumeMonitoring);
             }
         }
 
@@ -340,114 +324,403 @@ namespace MailPulse.UI
     {
         private readonly Services.ConfigService _config;
         private ObservableCollection<RuleRow> _rows = new ObservableCollection<RuleRow>();
-        private DataGrid _grid;
+        private ListBox _list;
 
         public class RuleRow
         {
-            public string Name { get; set; }
-            public string SubjectKeywords { get; set; }
-            public string BodyPatterns { get; set; }
-            public string SenderWhitelist { get; set; }
-            public bool NotifyWithCode { get; set; }
-            public bool NotifyWithLink { get; set; }
+            public Models.RuleConfig Rule { get; set; }
+            public string Name => Rule.Name;
+            public string MatchSummary
+            {
+                get
+                {
+                    int keywords = Rule.SubjectKeywords == null ? 0 : Rule.SubjectKeywords.Count;
+                    int patterns = Rule.BodyPatterns == null ? 0 : Rule.BodyPatterns.Count;
+                    return keywords + " 个主题关键词  ·  " + patterns + " 个正文正则";
+                }
+            }
+            public string OutputSummary => (Rule.NotifyWithCode ? "提取验证码" : "") +
+                (Rule.NotifyWithCode && Rule.NotifyWithLink ? " · " : "") +
+                (Rule.NotifyWithLink ? "提取链接" : "");
         }
 
         public RulesEditorWindow(Services.ConfigService config)
         {
             _config = config;
             Title = "规则编辑器";
-            Width = 840; Height = 520;
+            Width = 780; Height = 560;
+            MinWidth = 680; MinHeight = 480;
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
             Background = Theme.BgB;
 
-            var root = new DockPanel();
+            var root = new Grid { Margin = new Thickness(20) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-            var tip = new TextBlock
-            {
-                Text = "【主题关键词】用逗号分隔，【正文正则】用分号分隔；两者任一命中即触发。发件人白名单逗号分隔，可留空表示不限。",
-                Foreground = Theme.TextDimB,
-                Padding = new Thickness(14, 12, 14, 8),
-                TextWrapping = TextWrapping.Wrap,
-                FontSize = 12
-            };
-            DockPanel.SetDock(tip, Dock.Top);
-            root.Children.Add(tip);
+            var header = new StackPanel { Margin = new Thickness(0, 0, 0, 16) };
+            var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
+            titleRow.Children.Add(new TextBlock { Text = "匹配规则", Foreground = Theme.AccentB, FontSize = 22, FontWeight = FontWeights.Bold });
+            titleRow.Children.Add(new TextBlock { Text = "  识别验证码与确认链接邮件", Foreground = Theme.TextDimB, FontSize = 12, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(6, 0, 0, 3) });
+            header.Children.Add(titleRow);
+            header.Children.Add(new TextBlock { Text = "主题关键词或正文正则任一命中即触发；发件人白名单留空表示不限制。", Foreground = Theme.TextDimB, FontSize = 12, Margin = new Thickness(0, 4, 0, 0) });
+            Grid.SetRow(header, 0);
+            root.Children.Add(header);
 
-            _grid = new DataGrid
+            _list = new ListBox
             {
                 ItemsSource = _rows,
-                AutoGenerateColumns = false,
-                CanUserAddRows = false,
-                HeadersVisibility = DataGridHeadersVisibility.Column,
-                Margin = new Thickness(14),
-                Background = Theme.SurfaceB,
-                Foreground = Theme.TextB,
-                BorderBrush = Theme.BorderB,
-                RowBackground = Theme.SurfaceB,
-                AlternatingRowBackground = Theme.AltRowB,
-                GridLinesVisibility = DataGridGridLinesVisibility.Horizontal,
-                HorizontalGridLinesBrush = Theme.BorderB,
-                SelectionMode = DataGridSelectionMode.Single
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                HorizontalContentAlignment = HorizontalAlignment.Stretch
             };
-            _grid.Columns.Add(new DataGridTextColumn { Header = "规则名", Binding = new Binding("Name"), Width = new DataGridLength(120) });
-            _grid.Columns.Add(new DataGridTextColumn { Header = "主题关键词", Binding = new Binding("SubjectKeywords"), Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
-            _grid.Columns.Add(new DataGridTextColumn { Header = "正文正则", Binding = new Binding("BodyPatterns"), Width = new DataGridLength(1.6, DataGridLengthUnitType.Star) });
-            _grid.Columns.Add(new DataGridTextColumn { Header = "发件人白名单", Binding = new Binding("SenderWhitelist"), Width = new DataGridLength(130) });
-            _grid.Columns.Add(new DataGridCheckBoxColumn { Header = "提取码", Binding = new Binding("NotifyWithCode"), Width = new DataGridLength(56) });
-            _grid.Columns.Add(new DataGridCheckBoxColumn { Header = "提取链接", Binding = new Binding("NotifyWithLink"), Width = new DataGridLength(60) });
+            _list.ItemTemplate = BuildRuleTemplate();
+            var itemStyle = new Style(typeof(ListBoxItem));
+            itemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(12, 9, 12, 9)));
+            itemStyle.Setters.Add(new Setter(Control.MarginProperty, new Thickness(0, 2, 0, 2)));
+            itemStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
+            itemStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+            itemStyle.Setters.Add(new Setter(Control.CursorProperty, System.Windows.Input.Cursors.Hand));
+            var selected = new Trigger { Property = ListBoxItem.IsSelectedProperty, Value = true };
+            selected.Setters.Add(new Setter(Control.BackgroundProperty, Theme.SelectionB));
+            itemStyle.Triggers.Add(selected);
+            _list.ItemContainerStyle = itemStyle;
+            _list.MouseDoubleClick += (s, e) => EditSelected();
+            var card = Theme.Card(_list);
+            Grid.SetRow(card, 1);
+            root.Children.Add(card);
 
-            root.Children.Add(_grid);
-
-            var btnPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(16, 12, 16, 16) };
-            btnPanel.Children.Add(Theme.CreateButton("＋ 添加规则", () => { _rows.Add(new RuleRow()); _grid.CommitEdit(DataGridEditingUnit.Row, true); }, true));
-            btnPanel.Children.Add(Theme.CreateButton("－ 删除选中", () => { if (_grid.SelectedItem is RuleRow rr) _rows.Remove(rr); }));
-            btnPanel.Children.Add(Theme.CreateButton("保存并关闭", () => { SaveBack(); DialogResult = true; }));
-
-            DockPanel.SetDock(btnPanel, Dock.Bottom);
+            var btnPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 14, 0, 0) };
+            btnPanel.Children.Add(Theme.CreateButton("＋ 添加规则", AddRule, true));
+            btnPanel.Children.Add(Theme.CreateButton("编辑", EditSelected));
+            btnPanel.Children.Add(Theme.CreateButton("删除", DeleteSelected));
+            btnPanel.Children.Add(Theme.CreateButton("测试选中", TestSelected));
+            Grid.SetRow(btnPanel, 2);
             root.Children.Add(btnPanel);
+
+            var footer = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
+            footer.Children.Add(Theme.CreateButton("保存并关闭", () => { SaveBack(); DialogResult = true; }, true));
+            footer.Children.Add(Theme.CreateButton("取消", () => DialogResult = false));
+            Grid.SetRow(footer, 3);
+            root.Children.Add(footer);
 
             Content = root;
             LoadFromConfig();
+        }
+
+        private DataTemplate BuildRuleTemplate()
+        {
+            var template = new DataTemplate(typeof(RuleRow));
+            var grid = new FrameworkElementFactory(typeof(Grid));
+            var left = new FrameworkElementFactory(typeof(StackPanel));
+            var name = new FrameworkElementFactory(typeof(TextBlock));
+            name.SetBinding(TextBlock.TextProperty, new Binding("Name"));
+            name.SetValue(TextBlock.ForegroundProperty, Theme.TextB);
+            name.SetValue(TextBlock.FontSizeProperty, 14.0);
+            name.SetValue(TextBlock.FontWeightProperty, FontWeights.SemiBold);
+            left.AppendChild(name);
+            var summary = new FrameworkElementFactory(typeof(TextBlock));
+            summary.SetBinding(TextBlock.TextProperty, new Binding("MatchSummary"));
+            summary.SetValue(TextBlock.ForegroundProperty, Theme.TextDimB);
+            summary.SetValue(TextBlock.FontSizeProperty, 12.0);
+            summary.SetValue(TextBlock.MarginProperty, new Thickness(0, 3, 0, 0));
+            left.AppendChild(summary);
+            grid.AppendChild(left);
+            var output = new FrameworkElementFactory(typeof(TextBlock));
+            output.SetBinding(TextBlock.TextProperty, new Binding("OutputSummary"));
+            output.SetValue(TextBlock.ForegroundProperty, Theme.AccentB);
+            output.SetValue(TextBlock.FontSizeProperty, 12.0);
+            output.SetValue(TextBlock.VerticalAlignmentProperty, VerticalAlignment.Center);
+            output.SetValue(TextBlock.HorizontalAlignmentProperty, HorizontalAlignment.Right);
+            grid.AppendChild(output);
+            template.VisualTree = grid;
+            return template;
         }
 
         private void LoadFromConfig()
         {
             _rows.Clear();
             foreach (var r in _config.Current.Rules ?? Enumerable.Empty<Models.RuleConfig>())
-                _rows.Add(new RuleRow
-                {
-                    Name = r.Name,
-                    SubjectKeywords = string.Join(", ", r.SubjectKeywords ?? new List<string>()),
-                    BodyPatterns = string.Join("; ", r.BodyPatterns ?? new List<string>()),
-                    SenderWhitelist = string.Join(", ", r.SenderWhitelist ?? new List<string>()),
-                    NotifyWithCode = r.NotifyWithCode,
-                    NotifyWithLink = r.NotifyWithLink,
-                });
+                _rows.Add(new RuleRow { Rule = CloneRule(r) });
+        }
+
+        private RuleRow SelectedRow() => _list.SelectedItem as RuleRow;
+
+        private void AddRule()
+        {
+            var dlg = new RuleEditDialog(null) { Owner = this };
+            if (dlg.ShowDialog() != true) return;
+            _rows.Add(new RuleRow { Rule = dlg.Result() });
+            _list.SelectedIndex = _rows.Count - 1;
+        }
+
+        private void EditSelected()
+        {
+            var row = SelectedRow();
+            if (row == null) { MessageBox.Show("请先选中一个规则。"); return; }
+            int index = _rows.IndexOf(row);
+            var dlg = new RuleEditDialog(row.Rule) { Owner = this };
+            if (dlg.ShowDialog() != true) return;
+            _rows[index] = new RuleRow { Rule = dlg.Result() };
+            _list.SelectedIndex = index;
+        }
+
+        private void DeleteSelected()
+        {
+            var row = SelectedRow();
+            if (row == null) { MessageBox.Show("请先选中一个规则。"); return; }
+            if (MessageBox.Show("确定删除规则 \"" + row.Name + "\"？", "确认", MessageBoxButton.YesNo) == MessageBoxResult.Yes)
+                _rows.Remove(row);
+        }
+
+        private void TestSelected()
+        {
+            var row = SelectedRow();
+            if (row == null) { MessageBox.Show("请先选中一个规则。"); return; }
+            new RuleTestDialog(row.Rule) { Owner = this }.ShowDialog();
         }
 
         private void SaveBack()
         {
-            _grid.CommitEdit(DataGridEditingUnit.Row, true);
-            var rules = new List<Models.RuleConfig>();
-            foreach (var r in _rows)
-            {
-                if (string.IsNullOrWhiteSpace(r.Name)) continue;
-                rules.Add(new Models.RuleConfig
-                {
-                    Name = r.Name,
-                    SubjectKeywords = SplitCsv(r.SubjectKeywords).ToList(),
-                    BodyPatterns = r.BodyPatterns?.Split(';').Select(s => s.Trim()).Where(s => s.Length > 0).ToList() ?? new List<string>(),
-                    SenderWhitelist = SplitCsv(r.SenderWhitelist).ToList(),
-                    NotifyWithCode = r.NotifyWithCode,
-                    NotifyWithLink = r.NotifyWithLink,
-                });
-            }
-            _config.Current.Rules = rules;
+            _config.Current.Rules = _rows.Select(r => CloneRule(r.Rule)).ToList();
             _config.Save();
         }
 
-        private IEnumerable<string> SplitCsv(string s)
-            => (s ?? "").Split(',').Select(x => x.Trim()).Where(x => x.Length > 0);
+        private static Models.RuleConfig CloneRule(Models.RuleConfig r)
+        {
+            return new Models.RuleConfig
+            {
+                Name = r.Name,
+                SubjectKeywords = new List<string>(r.SubjectKeywords ?? new List<string>()),
+                BodyPatterns = new List<string>(r.BodyPatterns ?? new List<string>()),
+                SenderWhitelist = new List<string>(r.SenderWhitelist ?? new List<string>()),
+                NotifyWithCode = r.NotifyWithCode,
+                NotifyWithLink = r.NotifyWithLink
+            };
+        }
+    }
+
+    public class RuleEditDialog : Window
+    {
+        private TextBox _tbName, _tbKeywords, _tbPatterns, _tbSenders;
+        private CheckBox _chkCode, _chkLink;
+        private readonly Models.RuleConfig _editing;
+
+        public RuleEditDialog(Models.RuleConfig editing)
+        {
+            _editing = editing;
+            Title = editing == null ? "添加规则" : "编辑规则: " + (editing.Name ?? "");
+            Width = 620; Height = 660;
+            MinWidth = 560; MinHeight = 560;
+            WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            Background = Theme.BgB;
+
+            var root = new Grid { Margin = new Thickness(20) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var header = new StackPanel { Margin = new Thickness(0, 0, 0, 14) };
+            header.Children.Add(new TextBlock { Text = editing == null ? "添加匹配规则" : "编辑匹配规则", Foreground = Theme.AccentB, FontSize = 21, FontWeight = FontWeights.Bold });
+            header.Children.Add(new TextBlock { Text = "关键词与正则任一命中即可触发，可在保存前测试。", Foreground = Theme.TextDimB, FontSize = 12, Margin = new Thickness(0, 4, 0, 0) });
+            root.Children.Add(header);
+
+            var form = new StackPanel();
+            _tbName = AddField(form, "规则名称", false, 34);
+            _tbKeywords = AddField(form, "主题关键词", false, 34);
+            AddHint(form, "示例：验证码, verification code, OTP");
+            _tbPatterns = AddField(form, "正文正则", true, 112);
+            AddHint(form, "每行一个正则，捕获组 1 作为验证码。示例：(?:验证码|code)[^0-9]{0,10}(\\d{4,8})");
+            _tbSenders = AddField(form, "发件人白名单（可选）", false, 34);
+            AddHint(form, "示例：noreply@example.com, @github.com, mail.google.com；留空表示不限制发件人。");
+
+            var output = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+            _chkCode = new CheckBox { Content = "提取验证码", Foreground = Theme.TextB, Margin = new Thickness(0, 0, 24, 0) };
+            _chkLink = new CheckBox { Content = "提取确认链接", Foreground = Theme.TextB };
+            output.Children.Add(_chkCode);
+            output.Children.Add(_chkLink);
+            form.Children.Add(output);
+            var scroll = new ScrollViewer
+            {
+                Content = form,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            var card = Theme.Card(scroll);
+            Grid.SetRow(card, 1);
+            root.Children.Add(card);
+
+            var footer = new Grid { Margin = new Thickness(0, 16, 0, 0) };
+            footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var test = Theme.CreateButton("测试此规则", TestRule);
+            footer.Children.Add(test);
+            var right = new StackPanel { Orientation = Orientation.Horizontal };
+            right.Children.Add(Theme.CreateButton("保存", SaveAndClose, true));
+            right.Children.Add(Theme.CreateButton("取消", () => DialogResult = false));
+            Grid.SetColumn(right, 1);
+            footer.Children.Add(right);
+            Grid.SetRow(footer, 2);
+            root.Children.Add(footer);
+            Content = root;
+
+            if (editing != null)
+            {
+                _tbName.Text = editing.Name ?? "";
+                _tbKeywords.Text = string.Join(", ", editing.SubjectKeywords ?? new List<string>());
+                _tbPatterns.Text = string.Join(Environment.NewLine, editing.BodyPatterns ?? new List<string>());
+                _tbSenders.Text = string.Join(", ", editing.SenderWhitelist ?? new List<string>());
+                _chkCode.IsChecked = editing.NotifyWithCode;
+                _chkLink.IsChecked = editing.NotifyWithLink;
+            }
+            else
+            {
+                _chkCode.IsChecked = true;
+            }
+        }
+
+        private TextBox AddField(Panel panel, string label, bool multiline, double height)
+        {
+            panel.Children.Add(new TextBlock { Text = label, Foreground = Theme.TextB, FontSize = 12.5, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            var tb = new TextBox
+            {
+                AcceptsReturn = multiline,
+                TextWrapping = multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
+                VerticalScrollBarVisibility = multiline ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled,
+                Height = height,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            Theme.StyleTextBox(tb);
+            panel.Children.Add(tb);
+            return tb;
+        }
+
+        private void AddHint(Panel panel, string text)
+        {
+            panel.Children.Add(new TextBlock { Text = text, Foreground = Theme.TextDimB, FontSize = 11.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, -1, 0, 12) });
+        }
+
+        private void SaveAndClose()
+        {
+            string error = ValidateRule();
+            if (error != null) { MessageBox.Show(error, "无法保存"); return; }
+            DialogResult = true;
+        }
+
+        private void TestRule()
+        {
+            string error = ValidateRule();
+            if (error != null) { MessageBox.Show(error, "无法测试"); return; }
+            new RuleTestDialog(Result()) { Owner = this }.ShowDialog();
+        }
+
+        private string ValidateRule()
+        {
+            if (string.IsNullOrWhiteSpace(_tbName.Text)) return "请输入规则名称。";
+            var rule = Result();
+            if (rule.SubjectKeywords.Count == 0 && rule.BodyPatterns.Count == 0) return "请至少填写一个主题关键词或正文正则。";
+            foreach (var pattern in rule.BodyPatterns)
+            {
+                try { System.Text.RegularExpressions.Regex.Match("", pattern); }
+                catch (ArgumentException ex) { return "正文正则无效：\n" + pattern + "\n\n" + ex.Message; }
+            }
+            if (!rule.NotifyWithCode && !rule.NotifyWithLink) return "请至少选择一种提醒内容。";
+            return null;
+        }
+
+        public Models.RuleConfig Result()
+        {
+            return new Models.RuleConfig
+            {
+                Name = (_tbName.Text ?? "").Trim(),
+                SubjectKeywords = SplitCsv(_tbKeywords.Text),
+                BodyPatterns = SplitPatterns(_tbPatterns.Text),
+                SenderWhitelist = SplitCsv(_tbSenders.Text),
+                NotifyWithCode = _chkCode.IsChecked ?? false,
+                NotifyWithLink = _chkLink.IsChecked ?? false
+            };
+        }
+
+        private static List<string> SplitCsv(string value)
+        {
+            return (value ?? "").Split(new[] { ',', '，' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+        }
+
+        private static List<string> SplitPatterns(string value)
+        {
+            return (value ?? "").Split(new[] { "\r\n", "\n", ";" }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+        }
+    }
+
+    public class RuleTestDialog : Window
+    {
+        private readonly Models.RuleConfig _rule;
+        private TextBox _tbSubject, _tbBody, _tbFrom;
+        private TextBlock _result;
+
+        public RuleTestDialog(Models.RuleConfig rule)
+        {
+            _rule = rule;
+            Title = "测试规则: " + (rule.Name ?? "");
+            Width = 620; Height = 560;
+            MinWidth = 540; MinHeight = 500;
+            WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            Background = Theme.BgB;
+
+            var root = new Grid { Margin = new Thickness(20) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.Children.Add(new TextBlock { Text = "规则测试", Foreground = Theme.AccentB, FontSize = 21, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 14) });
+
+            var form = new StackPanel();
+            _tbSubject = Field(form, "邮件主题", false, 34);
+            _tbSubject.Text = "您的验证码";
+            _tbFrom = Field(form, "发件人", false, 34);
+            _tbFrom.Text = "test@example.com";
+            _tbBody = Field(form, "邮件正文", true, 150);
+            _tbBody.Text = "你的验证码是 ASFE466，5分钟内有效。";
+            _result = new TextBlock { Text = "填写邮件样本后点击“运行测试”。", Foreground = Theme.TextDimB, FontSize = 13, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 14, 0, 0) };
+            form.Children.Add(_result);
+            var card = Theme.Card(form);
+            Grid.SetRow(card, 1);
+            root.Children.Add(card);
+
+            var footer = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
+            footer.Children.Add(Theme.CreateButton("运行测试", RunTest, true));
+            footer.Children.Add(Theme.CreateButton("关闭", Close));
+            Grid.SetRow(footer, 2);
+            root.Children.Add(footer);
+            Content = root;
+        }
+
+        private TextBox Field(Panel panel, string label, bool multiline, double height)
+        {
+            panel.Children.Add(new TextBlock { Text = label, Foreground = Theme.TextB, FontSize = 12.5, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            var tb = new TextBox { AcceptsReturn = multiline, TextWrapping = multiline ? TextWrapping.Wrap : TextWrapping.NoWrap, Height = height, Margin = new Thickness(0, 0, 0, 12), VerticalScrollBarVisibility = multiline ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled };
+            Theme.StyleTextBox(tb);
+            panel.Children.Add(tb);
+            return tb;
+        }
+
+        private void RunTest()
+        {
+            var engine = new Services.ClassificationEngine();
+            var result = engine.Evaluate(_tbSubject.Text, _tbBody.Text, _tbFrom.Text, "规则测试", new List<Models.RuleConfig> { _rule });
+            if (result.Matched)
+            {
+                _result.Foreground = Theme.AccentB;
+                _result.Text = "✓ 规则已命中\n验证码：" + (result.Code ?? "未提取") + "\n链接：" + (result.Url ?? "未提取");
+            }
+            else
+            {
+                _result.Foreground = Theme.DangerB;
+                _result.Text = "未命中。请检查主题关键词、正文正则和发件人白名单是否与样本一致。";
+            }
+        }
     }
 }
 

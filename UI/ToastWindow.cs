@@ -20,7 +20,10 @@ namespace MailPulse.UI
             ShowInTaskbar = false;
             Topmost = true;
             ShowActivated = false;
-            Width = 420; Height = 232;
+            Width = 420;
+            Height = string.IsNullOrWhiteSpace(result.BodyPreview)
+                ? 232
+                : (!string.IsNullOrEmpty(result.Code) && !string.IsNullOrEmpty(result.Url) ? 360 : 322);
             Background = Brushes.Transparent;
             Opacity = 0;
 
@@ -59,14 +62,21 @@ namespace MailPulse.UI
                 Background = Theme.AccentB,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            icon.Child = new TextBlock { Text = "✉", Foreground = Brushes.White, FontSize = 13, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+            icon.Child = new TextBlock
+            {
+                Text = result.IsAiAgent ? "🤖" : "✉",
+                Foreground = Brushes.White,
+                FontSize = result.IsAiAgent ? 14 : 13,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
             Grid.SetColumn(icon, 0);
             header.Children.Add(icon);
             var title = new TextBlock
             {
                 Text = (result.AccountName ?? "新邮件") + " · 新邮件",
                 Foreground = Theme.TextB,
-                FontSize = 14,
+                FontSize = 13,
                 FontWeight = FontWeights.SemiBold,
                 Margin = new Thickness(10, 0, 0, 0),
                 VerticalAlignment = VerticalAlignment.Center,
@@ -90,12 +100,21 @@ namespace MailPulse.UI
             {
                 Text = result.Summary ?? "",
                 Foreground = Theme.TextB,
-                FontSize = 13,
+                FontSize = 12,
                 Margin = new Thickness(0, 7, 0, 4),
                 MaxHeight = 40,
                 TextWrapping = TextWrapping.Wrap,
                 TextTrimming = TextTrimming.CharacterEllipsis
             });
+
+            var dismiss = Theme.CreateButton("忽略", () =>
+            {
+                try { result.MarkAsRead?.Invoke(); } catch { }
+                Close();
+            }, true);
+            dismiss.Padding = new Thickness(16, 8, 16, 8);
+            dismiss.FontSize = 12;
+            dismiss.Margin = new Thickness(8, 0, 0, 0);
 
             // code row
             if (!string.IsNullOrEmpty(result.Code))
@@ -108,30 +127,65 @@ namespace MailPulse.UI
                     Padding = new Thickness(12, 4, 12, 4),
                     VerticalAlignment = VerticalAlignment.Center
                 };
-                codeBox.Child = new TextBlock { Text = result.Code, Foreground = Theme.CodeB, FontSize = 24, FontWeight = FontWeights.Bold };
+                codeBox.Child = new TextBlock { Text = result.Code, Foreground = Theme.CodeB, FontSize = 20, FontWeight = FontWeights.Bold };
                 codeRow.Children.Add(codeBox);
-                codeRow.Children.Add(Theme.CreateButton("复制", () =>
+                var copyButton = Theme.CreateButton("复制", () =>
                 {
                     try { Clipboard.SetText(result.Code); } catch { }
                     try { result.MarkAsRead?.Invoke(); } catch { }
                     Close();
-                }));
+                });
+                copyButton.Margin = new Thickness(10, 0, 0, 0);
+                copyButton.Padding = new Thickness(16, 8, 16, 8);
+                copyButton.FontSize = 12;
+                codeRow.Children.Add(copyButton);
+                codeRow.Children.Add(dismiss);
                 stack.Children.Add(codeRow);
             }
 
             if (!string.IsNullOrEmpty(result.Url))
             {
                 var linkRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 2, 0, 4) };
-                linkRow.Children.Add(Theme.CreateButton("打开链接", () =>
+                var openLink = Theme.CreateButton("打开链接", () =>
                 {
                     try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(result.Url) { UseShellExecute = true }); } catch { }
                     try { result.MarkAsRead?.Invoke(); } catch { }
                     Close();
-                }));
+                });
+                linkRow.Children.Add(openLink);
+                if (string.IsNullOrEmpty(result.Code))
+                {
+                    dismiss.Margin = new Thickness(0);
+                    linkRow.Children.Add(dismiss);
+                }
                 stack.Children.Add(linkRow);
             }
 
+            if (!string.IsNullOrWhiteSpace(result.BodyPreview))
+            {
+                var preview = new Border
+                {
+                    Background = Theme.SurfaceHiB,
+                    CornerRadius = new CornerRadius(7),
+                    Padding = new Thickness(10, 8, 10, 8),
+                    Margin = new Thickness(0, 7, 0, 0),
+                    MinHeight = 125
+                };
+                preview.Child = new TextBlock
+                {
+                    Text = result.BodyPreview,
+                    Foreground = Theme.TextDimB,
+                    FontSize = 11.5,
+                    LineHeight = 17,
+                    MaxHeight = 112,
+                    TextWrapping = TextWrapping.Wrap,
+                    TextTrimming = TextTrimming.CharacterEllipsis
+                };
+                stack.Children.Add(preview);
+            }
+
             if (string.IsNullOrEmpty(result.Code) && string.IsNullOrEmpty(result.Url))
+            {
                 stack.Children.Add(new TextBlock
                 {
                     Text = "⚠ 规则命中，但未提取到验证码或链接，请打开邮件查看",
@@ -140,15 +194,11 @@ namespace MailPulse.UI
                     Margin = new Thickness(0, 8, 0, 4),
                     TextWrapping = TextWrapping.Wrap
                 });
-
-            var footer = new Grid { Margin = new Thickness(0, 10, 0, 0) };
-            footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var dismiss = Theme.CreateButton("忽略", () => { try { result.MarkAsRead?.Invoke(); } catch { } Close(); }, true);
-            dismiss.HorizontalAlignment = HorizontalAlignment.Right;
-            Grid.SetColumn(dismiss, 1);
-            footer.Children.Add(dismiss);
-            stack.Children.Add(footer);
+                var dismissRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 5, 0, 0) };
+                dismiss.Margin = new Thickness(0);
+                dismissRow.Children.Add(dismiss);
+                stack.Children.Add(dismissRow);
+            }
 
             Grid.SetRow(stack, 0);
             root.Children.Add(stack);

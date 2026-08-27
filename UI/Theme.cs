@@ -102,6 +102,8 @@ namespace MailPulse.UI
             Color idle = primary ? Accent : SurfaceHi;
             Color hover = primary ? AccentHi : Hover;
             Color border = primary ? Accent : Border;
+            Color disabled = Desaturate(Accent, 0.55);
+            b.Resources["MailPulse.DisabledButtonBackground"] = Brush(disabled);
             b.Background = Brush(idle);
             b.BorderBrush = Brush(border);
             if (primary) b.Foreground = Brushes.White;
@@ -121,13 +123,85 @@ namespace MailPulse.UI
             template.VisualTree = borderFactory;
             b.Template = template;
 
-            b.MouseEnter += (s, e) => { if (b.IsEnabled) b.Background = Brush(hover); };
-            b.MouseLeave += (s, e) => { if (b.IsEnabled) b.Background = Brush(idle); };
+            b.MouseEnter += (s, e) => { if (b.IsEnabled && !(b.Tag is ButtonLoadingState)) b.Background = Brush(hover); };
+            b.MouseLeave += (s, e) => { if (b.IsEnabled && !(b.Tag is ButtonLoadingState)) b.Background = Brush(idle); };
             b.IsEnabledChanged += (s, e) =>
             {
                 if (b.IsEnabled) b.Background = Brush(idle);
-                else b.Background = Brush(DisabledBg);
+                else b.Background = Brush(disabled);
             };
+        }
+
+        private static Color Desaturate(Color color, double amount)
+        {
+            double gray = color.R * 0.299 + color.G * 0.587 + color.B * 0.114;
+            byte Blend(byte value) => (byte)Math.Round(value * (1 - amount) + gray * amount);
+            return Color.FromRgb(Blend(color.R), Blend(color.G), Blend(color.B));
+        }
+
+        private sealed class ButtonLoadingState
+        {
+            public object Content;
+            public Brush Background;
+            public Brush BorderBrush;
+            public Brush Foreground;
+            public System.Windows.Input.Cursor Cursor;
+            public bool IsHitTestVisible;
+        }
+
+        /// <summary>Shows a visible busy indicator while preventing duplicate clicks.</summary>
+        public static void SetButtonLoading(Button button, bool loading, string text = "处理中…")
+        {
+            if (button == null) return;
+            if (loading)
+            {
+                if (button.Tag is ButtonLoadingState) return;
+                button.Tag = new ButtonLoadingState
+                {
+                    Content = button.Content,
+                    Background = button.Background,
+                    BorderBrush = button.BorderBrush,
+                    Foreground = button.Foreground,
+                    Cursor = button.Cursor,
+                    IsHitTestVisible = button.IsHitTestVisible
+                };
+                var content = new StackPanel { Orientation = Orientation.Horizontal };
+                content.Children.Add(new ProgressBar
+                {
+                    IsIndeterminate = true,
+                    Width = 34,
+                    Height = 5,
+                    Margin = new Thickness(0, 0, 8, 0),
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                content.Children.Add(new TextBlock
+                {
+                    Text = text,
+                    Foreground = Brushes.White,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                button.Content = content;
+                button.Background = AccentB;
+                button.BorderBrush = AccentB;
+                button.Foreground = Brushes.White;
+                button.Cursor = System.Windows.Input.Cursors.Wait;
+                button.IsHitTestVisible = false;
+                return;
+            }
+
+            var state = button.Tag as ButtonLoadingState;
+            if (state == null) return;
+            button.Content = state.Content;
+            button.Background = state.Background;
+            button.BorderBrush = state.BorderBrush;
+            button.Foreground = state.Foreground;
+            button.Cursor = state.Cursor;
+            button.IsHitTestVisible = state.IsHitTestVisible;
+            button.Tag = null;
+            if (!button.IsEnabled)
+                button.Background = button.Resources.Contains("MailPulse.DisabledButtonBackground")
+                    ? button.Resources["MailPulse.DisabledButtonBackground"] as Brush
+                    : Brush(DisabledBg);
         }
 
         public static void StyleTextBox(TextBox t, double width = double.NaN)
@@ -162,7 +236,9 @@ namespace MailPulse.UI
             itemStyle.Triggers.Add(hover);
             var sel = new Trigger { Property = ListBoxItem.IsSelectedProperty, Value = true };
             sel.Setters.Add(new Setter(Control.BackgroundProperty, AccentB));
-            sel.Setters.Add(new Setter(Control.ForegroundProperty, Brushes.White));
+            // Theme text color preserves contrast on both the light selection fill
+            // and the dark-theme selection fill, including the hovered state.
+            sel.Setters.Add(new Setter(Control.ForegroundProperty, TextB));
             itemStyle.Triggers.Add(sel);
             c.ItemContainerStyle = itemStyle;
             c.Resources = new ResourceDictionary { [typeof(ComboBoxItem)] = itemStyle };
@@ -173,6 +249,8 @@ namespace MailPulse.UI
 
             var toggle = new FrameworkElementFactory(typeof(System.Windows.Controls.Primitives.ToggleButton));
             toggle.SetValue(Control.BackgroundProperty, Brush(InputBg));
+            toggle.SetValue(Control.ForegroundProperty, TextB);
+            toggle.SetValue(System.Windows.Documents.TextElement.ForegroundProperty, TextB);
             toggle.SetValue(Control.BorderBrushProperty, BorderB);
             toggle.SetValue(Control.BorderThicknessProperty, new Thickness(1));
             toggle.SetValue(Control.CursorProperty, System.Windows.Input.Cursors.Hand);
@@ -210,6 +288,9 @@ namespace MailPulse.UI
             content.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Left);
             content.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
             content.SetValue(ContentPresenter.IsHitTestVisibleProperty, false);
+            // SelectionBoxItem can retain the popup item's white foreground in light mode.
+            // Force the collapsed selected value to use the current theme text color.
+            content.SetValue(System.Windows.Documents.TextElement.ForegroundProperty, TextB);
             grid.AppendChild(content);
 
             var popup = new FrameworkElementFactory(typeof(System.Windows.Controls.Primitives.Popup));
@@ -233,6 +314,81 @@ namespace MailPulse.UI
 
             template.VisualTree = grid;
             c.Template = template;
+        }
+
+        /// <summary>Rounded, theme-aware context menu used by list actions.</summary>
+        public static void StyleContextMenu(ContextMenu menu)
+        {
+            menu.Background = Brushes.Transparent;
+            menu.BorderThickness = new Thickness(0);
+            menu.Padding = new Thickness(0);
+            menu.HasDropShadow = true;
+
+            var menuTemplate = new ControlTemplate(typeof(ContextMenu));
+            var shell = new FrameworkElementFactory(typeof(System.Windows.Controls.Border));
+            shell.SetValue(System.Windows.Controls.Border.BackgroundProperty, SurfaceB);
+            shell.SetValue(System.Windows.Controls.Border.BorderBrushProperty, BorderB);
+            shell.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new Thickness(1));
+            shell.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(9));
+            shell.SetValue(System.Windows.Controls.Border.PaddingProperty, new Thickness(5));
+            shell.SetValue(System.Windows.Controls.Border.SnapsToDevicePixelsProperty, true);
+            var presenter = new FrameworkElementFactory(typeof(ItemsPresenter));
+            shell.AppendChild(presenter);
+            menuTemplate.VisualTree = shell;
+            menu.Template = menuTemplate;
+
+            var itemStyle = new Style(typeof(MenuItem));
+            itemStyle.Setters.Add(new Setter(Control.ForegroundProperty, TextB));
+            itemStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
+            itemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(11, 8, 16, 8)));
+            itemStyle.Setters.Add(new Setter(Control.FontSizeProperty, 13.0));
+            itemStyle.Setters.Add(new Setter(Control.CursorProperty, System.Windows.Input.Cursors.Hand));
+
+            var itemTemplate = new ControlTemplate(typeof(MenuItem));
+            var itemBorder = new FrameworkElementFactory(typeof(System.Windows.Controls.Border));
+            itemBorder.Name = "ItemBorder";
+            itemBorder.SetValue(System.Windows.Controls.Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+            itemBorder.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(6));
+            var itemGrid = new FrameworkElementFactory(typeof(Grid));
+            var iconColumn = new FrameworkElementFactory(typeof(ColumnDefinition));
+            iconColumn.SetValue(ColumnDefinition.WidthProperty, new GridLength(25));
+            var textColumn = new FrameworkElementFactory(typeof(ColumnDefinition));
+            textColumn.SetValue(ColumnDefinition.WidthProperty, GridLength.Auto);
+            itemGrid.AppendChild(iconColumn);
+            itemGrid.AppendChild(textColumn);
+            var icon = new FrameworkElementFactory(typeof(ContentPresenter));
+            icon.SetValue(ContentPresenter.ContentSourceProperty, "Icon");
+            icon.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            itemGrid.AppendChild(icon);
+            var header = new FrameworkElementFactory(typeof(ContentPresenter));
+            header.SetValue(Grid.ColumnProperty, 1);
+            header.SetValue(ContentPresenter.ContentSourceProperty, "Header");
+            header.SetValue(ContentPresenter.RecognizesAccessKeyProperty, true);
+            header.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            header.SetValue(ContentPresenter.MarginProperty, new TemplateBindingExtension(Control.PaddingProperty));
+            itemGrid.AppendChild(header);
+            itemBorder.AppendChild(itemGrid);
+            itemTemplate.VisualTree = itemBorder;
+            var highlighted = new Trigger { Property = MenuItem.IsHighlightedProperty, Value = true };
+            highlighted.Setters.Add(new Setter(Control.BackgroundProperty, Brush(Hover)));
+            itemTemplate.Triggers.Add(highlighted);
+            var disabled = new Trigger { Property = UIElement.IsEnabledProperty, Value = false };
+            disabled.Setters.Add(new Setter(Control.OpacityProperty, 0.45));
+            itemTemplate.Triggers.Add(disabled);
+            itemStyle.Setters.Add(new Setter(Control.TemplateProperty, itemTemplate));
+
+            var separatorStyle = new Style(typeof(Separator));
+            separatorStyle.Setters.Add(new Setter(Control.HeightProperty, 1.0));
+            separatorStyle.Setters.Add(new Setter(Control.MarginProperty, new Thickness(8, 5, 8, 5)));
+            separatorStyle.Setters.Add(new Setter(Control.BackgroundProperty, BorderB));
+            var separatorTemplate = new ControlTemplate(typeof(Separator));
+            var separatorBorder = new FrameworkElementFactory(typeof(System.Windows.Controls.Border));
+            separatorBorder.SetValue(System.Windows.Controls.Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+            separatorTemplate.VisualTree = separatorBorder;
+            separatorStyle.Setters.Add(new Setter(Control.TemplateProperty, separatorTemplate));
+
+            menu.Resources[typeof(MenuItem)] = itemStyle;
+            menu.Resources[typeof(Separator)] = separatorStyle;
         }
 
         public static TextBlock Label(string text)

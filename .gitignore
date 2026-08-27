@@ -11,6 +11,9 @@ obj/
 # Local user data / logs (never commit)
 *.log
 seen.json
+config.json
+config/
+logs/
 
 # Publish / temp
 publish/

@@ -15,12 +15,21 @@ namespace MailPulse.Models
         public bool UseSsl { get; set; } = true;
         public string User { get; set; }
 
+        // Outgoing mail. Empty host falls back to a provider/domain-based guess.
+        public string SmtpHost { get; set; }
+        public int SmtpPort { get; set; } = 465;
+        public bool SmtpUseSsl { get; set; } = true;
+
         // Basic auth (DPAPI-protected)
         public string EncryptedPassword { get; set; }
         // OAuth2 (Microsoft) - refresh token DPAPI-protected
         public bool UseOAuth { get; set; }
         public string EncryptedRefreshToken { get; set; }
+        public string EncryptedImapRefreshToken { get; set; }
+        public string EncryptedSmtpRefreshToken { get; set; }
+        public string EncryptedGraphRefreshToken { get; set; }
         public string OAuthUserEmail { get; set; }   // upn used in SASL
+        public string OAuthClientId { get; set; }    // public Entra app id; not a secret
 
         public bool Enabled { get; set; } = true;
         public int PollIntervalSeconds { get; set; } = 45;
@@ -32,6 +41,22 @@ namespace MailPulse.Models
                 ["QQ"]      = ("imap.qq.com", 993, 995),
                 ["Outlook"] = ("outlook.office365.com", 993, 995),
             };
+
+        public static string GuessSmtpHost(string incomingHost, string user)
+        {
+            string host = (incomingHost ?? "").ToLowerInvariant();
+            string address = (user ?? "").ToLowerInvariant();
+            if (host.Contains("gmail") || address.EndsWith("@gmail.com")) return "smtp.gmail.com";
+            if (host.Contains("qq.com") || address.EndsWith("@qq.com")) return "smtp.qq.com";
+            if (host.Contains("office365") || host.Contains("outlook") || address.EndsWith("@outlook.com") ||
+                address.EndsWith("@hotmail.com") || address.EndsWith("@live.com") || address.EndsWith("@live.cn"))
+                return "smtp.office365.com";
+            if (host.StartsWith("imap.")) return "smtp." + host.Substring(5);
+            if (host.StartsWith("pop.")) return "smtp." + host.Substring(4);
+            if (host.StartsWith("pop3.")) return "smtp." + host.Substring(5);
+            int at = address.LastIndexOf('@');
+            return at >= 0 ? "smtp." + address.Substring(at + 1) : "";
+        }
     }
 
     public enum LlmProtocol { OpenAiChat, OpenAiResponses, Anthropic }
@@ -128,8 +153,10 @@ namespace MailPulse.Models
         public string Code { get; set; }
         public string Url { get; set; }
         public string Summary { get; set; }
+        public string BodyPreview { get; set; }
         public string From { get; set; }
         public string AccountName { get; set; }
+        public bool IsAiAgent { get; set; }
         /// <summary>Runtime callback to mark the source mail as read (IMAP only).</summary>
         [Newtonsoft.Json.JsonIgnore]
         public Action MarkAsRead { get; set; }

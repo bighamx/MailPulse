@@ -48,19 +48,30 @@ namespace MailPulse.Services
 
         private async Task MonitorAccountLoop(Models.AccountConfig acc, CancellationToken token)
         {
+            int consecutiveFailures = 0;
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    if (acc.Protocol == Models.MailProtocol.Imap)
+                    if (MailCenterService.IsGraphAccount(acc))
+                        await PollGraphOnce(acc, token);
+                    else if (acc.Protocol == Models.MailProtocol.Imap)
                         await ImapIdleAsync(acc, token);
                     else
                         await PollPop3Once(acc);
+                    consecutiveFailures = 0;
                 }
                 catch (OperationCanceledException) { break; }
-                catch (Exception ex) { Services.Logger.Error("monitor loop error for " + acc.Name, ex); }
+                catch (Exception ex)
+                {
+                    consecutiveFailures++;
+                    Services.Logger.Error("monitor loop error for " + acc.Name, ex);
+                }
                 if (token.IsCancellationRequested) break;
-                try { await Task.Delay(TimeSpan.FromSeconds(10), token); } catch (OperationCanceledException) { break; }
+                int delaySeconds = consecutiveFailures == 0
+                    ? 10
+                    : Math.Min(300, 15 * (1 << Math.Min(4, consecutiveFailures)));
+                try { await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token); } catch (OperationCanceledException) { break; }
             }
         }
 
@@ -68,8 +79,17 @@ namespace MailPulse.Services
         {
             using (var client = new ImapClient())
             {
-                await client.ConnectAsync(acc.Host, acc.Port, MailKit.Security.SecureSocketOptions.SslOnConnect, token);
-                await AuthenticateImapAsync(client, acc, token);
+                IDisposable authenticationLease = null;
+                if (acc.UseOAuth)
+                    authenticationLease = await MicrosoftOAuthService.EnterAuthenticationAsync(acc.Id, token);
+                try
+                {
+                    await client.ConnectAsync(acc.Host, acc.Port, acc.UseSsl
+                        ? MailKit.Security.SecureSocketOptions.Auto
+                        : MailKit.Security.SecureSocketOptions.None, token);
+                    await AuthenticateImapAsync(client, acc, token);
+                }
+                finally { authenticationLease?.Dispose(); }
                 var inbox = client.Inbox;
                 await inbox.OpenAsync(FolderAccess.ReadWrite, token);
 
@@ -146,7 +166,9 @@ namespace MailPulse.Services
         {
             using (var client = new Pop3Client())
             {
-                await client.ConnectAsync(acc.Host, acc.Port, MailKit.Security.SecureSocketOptions.SslOnConnect);
+                await client.ConnectAsync(acc.Host, acc.Port, acc.UseSsl
+                    ? MailKit.Security.SecureSocketOptions.Auto
+                    : MailKit.Security.SecureSocketOptions.None);
                 await client.AuthenticateAsync(acc.User, SecureStore.Unprotect(acc.EncryptedPassword));
                 int count = client.Count;
                 var seenSet = _seenUids.GetOrAdd(acc.Id, _ => new HashSet<string>());
@@ -170,13 +192,47 @@ namespace MailPulse.Services
             }
         }
 
+        private async Task PollGraphOnce(Models.AccountConfig acc, CancellationToken token)
+        {
+            using (var service = new MailCenterService(_config))
+            {
+                var rows = await service.LoadInboxAsync(acc, 20, token);
+                foreach (var row in rows.Where(x => x.IsUnread).Take(10))
+                {
+                    string key = acc.Id + "|graph|" + row.Id;
+                    var seenSet = _seenUids.GetOrAdd(acc.Id, _ => new HashSet<string>());
+                    lock (seenSet)
+                    {
+                        if (seenSet.Contains(row.Id)) continue;
+                        seenSet.Add(row.Id);
+                    }
+                    if (_seen.Contains(key)) continue;
+                    var content = await service.LoadMessageAsync(acc, row.Id, token);
+                    var message = new MimeMessage { Subject = content.Subject ?? "" };
+                    MailboxAddress mailbox;
+                    if (MailboxAddress.TryParse(content.From, out mailbox)) message.From.Add(mailbox);
+                    message.Body = new TextPart("plain") { Text = content.Body ?? "" };
+                    string messageId = row.Id;
+                    await ProcessMessageAsync(acc, message, key, () => Task.Run(async () =>
+                    {
+                        try
+                        {
+                            using (var marker = new MailCenterService(_config))
+                                await marker.MarkAsReadAsync(acc, messageId, CancellationToken.None);
+                        }
+                        catch { }
+                    }), token);
+                }
+            }
+        }
+
         private async Task ProcessMessageAsync(Models.AccountConfig acc, MimeMessage msg, string seenKey, Action markRead, CancellationToken token)
         {
-            string body = msg.TextBody ?? msg.HtmlBody ?? "";
+            string body = TextEncodingRepair.Repair(msg.TextBody ?? msg.HtmlBody ?? "");
             if (!string.IsNullOrEmpty(body) && body.TrimStart().StartsWith("<"))
                 body = System.Text.RegularExpressions.Regex.Replace(body, "<[^>]+>", " ");
-            string subject = msg.Subject ?? "";
-            string from = msg.From?.ToString() ?? "";
+            string subject = TextEncodingRepair.Repair(msg.Subject ?? "");
+            string from = TextEncodingRepair.Repair(msg.From?.ToString() ?? "");
             var r = _engine.Evaluate(subject, body, from, acc.Name, _config.Current.Rules);
 
             if (!r.Matched && _config.Current.LlmFallbackEnabled)
@@ -195,6 +251,7 @@ namespace MailPulse.Services
 
             if (r.Matched)
             {
+                r.BodyPreview = CreateBodyPreview(body);
                 _seen.Add(seenKey);   // persist: never re-alert this mail after restart
                 r.MarkAsRead = markRead;
                 if (_config.Current.AutoCopyCode && !string.IsNullOrEmpty(r.Code))
@@ -203,24 +260,41 @@ namespace MailPulse.Services
             }
         }
 
+        internal static string CreateBodyPreview(string body)
+        {
+            if (string.IsNullOrWhiteSpace(body)) return "";
+            string preview = System.Net.WebUtility.HtmlDecode(body);
+            preview = System.Text.RegularExpressions.Regex.Replace(preview, @"\s+", " ").Trim();
+            const int maxLength = 480;
+            return preview.Length <= maxLength ? preview : preview.Substring(0, maxLength).TrimEnd() + "…";
+        }
+
         private async Task AuthenticateImapAsync(ImapClient client, Models.AccountConfig acc, System.Threading.CancellationToken token)
         {
             if (acc.UseOAuth)
             {
-                var refresh = SecureStore.Unprotect(acc.EncryptedRefreshToken);
+                string protectedRefresh = !string.IsNullOrWhiteSpace(acc.EncryptedImapRefreshToken)
+                    ? acc.EncryptedImapRefreshToken
+                    : (string.IsNullOrWhiteSpace(acc.OAuthClientId) ? acc.EncryptedRefreshToken : "");
+                var refresh = SecureStore.Unprotect(protectedRefresh);
                 if (string.IsNullOrEmpty(refresh))
-                    throw new Exception("OAuth refresh token missing; please re-login in settings.");
-                var r = await MicrosoftOAuthService.RefreshAsync(refresh);
+                    throw new Exception("Outlook quick-read authorization is missing; select quick login in account settings and authorize reading.");
+                var r = await MicrosoftOAuthService.RefreshAsync(refresh, "", acc.Id);
                 if (!r.Success) throw new Exception("OAuth refresh failed: " + r.Error);
                 if (!string.IsNullOrEmpty(r.NewRefreshToken))
                 {
-                    acc.EncryptedRefreshToken = SecureStore.Protect(r.NewRefreshToken);
-                    _config.Save();
+                    acc.EncryptedImapRefreshToken = SecureStore.Protect(r.NewRefreshToken);
+                    acc.EncryptedRefreshToken = acc.EncryptedImapRefreshToken;
+                    _config.TrySave("monitor OAuth refresh token");
                 }
                 var sasl = new MailKit.Security.SaslMechanismOAuth2(
                     string.IsNullOrEmpty(acc.OAuthUserEmail) ? acc.User : acc.OAuthUserEmail,
                     r.AccessToken);
-                await client.AuthenticateAsync(sasl, token);
+                try { await client.AuthenticateAsync(sasl, token); }
+                catch (MailKit.Security.AuthenticationException ex)
+                {
+                    throw new Exception("OAuth token was accepted by Entra, but Outlook rejected IMAP authentication. Verify the authorized mailbox identity and that IMAP is enabled. " + ex.Message, ex);
+                }
             }
             else
             {

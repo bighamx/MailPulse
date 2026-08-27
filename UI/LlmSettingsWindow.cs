@@ -225,7 +225,7 @@ namespace MailPulse.UI
         {
             var cfg = Selected();
             if (cfg == null) { MessageBox.Show("请先选中一个配置。"); return; }
-            _btnTest.IsEnabled = false;
+            Theme.SetButtonLoading(_btnTest, true, "测试中…");
             try
             {
                 var cls = new Services.LlmClassifier();
@@ -241,7 +241,7 @@ namespace MailPulse.UI
             {
                 MessageBox.Show("测试失败: " + ex.Message, "错误");
             }
-            finally { _btnTest.IsEnabled = true; }
+            finally { Theme.SetButtonLoading(_btnTest, false); }
         }
 
         private void Save()

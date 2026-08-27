@@ -7,8 +7,13 @@
     <LangVersion>7.3</LangVersion>
     <RootNamespace>MailPulse</RootNamespace>
     <AssemblyName>MailPulse</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
+    <ApplicationIcon>Assets\MailPulse.ico</ApplicationIcon>
   </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="Assets\MailPulse.ico" />
+    <Resource Include="Assets\MailPulse.png" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="MailKit" Version="4.8.0" />
     <PackageReference Include="Costura.Fody" Version="5.7.0" PrivateAssets="All" />
