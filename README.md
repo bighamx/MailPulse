@@ -8,13 +8,47 @@
 
 ## 📸 截图
 
-| 浅色主界面 | 深色主界面                                   |
-| ---------- | -------------------------------------------- |
-| .          | ![main-dark](docs/screenshots/main-dark.png) |
+<details>
+<summary>浅色主界面</summary>
 
-| 账号编辑                                              | 规则编辑器                                        | LLM 设置                                        | LLM 配置                                                | 验证码通知                                 |
-| ----------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------- | ------------------------------------------ |
-| ![account](docs/screenshots/account-dialog-light.png) | ![rules](docs/screenshots/rules-editor-light.png) | ![llm](docs/screenshots/llm-settings-light.png) | ![llmcfg](docs/screenshots/llm-config-dialog-light.png) | ![toast](docs/screenshots/toast-light.png) |
+![浅色主界面](docs/screenshots/main-light.png)
+
+</details>
+
+<details>
+<summary>账号编辑</summary>
+
+![账号编辑](docs/screenshots/account-dialog-light.png)
+
+</details>
+
+<details>
+<summary>规则编辑器</summary>
+
+![规则编辑器](docs/screenshots/rules-editor-light.png)
+
+</details>
+
+<details>
+<summary>LLM 设置</summary>
+
+![LLM 设置](docs/screenshots/llm-settings-light.png)
+
+</details>
+
+<details>
+<summary>LLM 配置</summary>
+
+![LLM 配置](docs/screenshots/llm-config-dialog-light.png)
+
+</details>
+
+<details>
+<summary>验证码通知</summary>
+
+![验证码通知](docs/screenshots/toast-light.png)
+
+</details>
 
 ## ✨ 功能特性
 
