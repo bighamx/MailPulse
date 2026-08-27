@@ -267,7 +267,7 @@ namespace MailPulse.UI
         {
             _editing = editing;
             Title = editing == null ? "添加 LLM 配置" : "编辑 LLM 配置: " + (editing.Name ?? "");
-            Width = 520; Height = 460;
+            Width = 520; Height = 490;
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
             ResizeMode = ResizeMode.NoResize;
             Background = Theme.BgB;
@@ -302,7 +302,15 @@ namespace MailPulse.UI
             AddLabel(g, r, "API Key");
             _tbKey = new TextBox { Margin = new Thickness(0, 3, 0, 3) };
             Theme.StyleTextBox(_tbKey);
-            Grid.SetRow(_tbKey, r); Grid.SetColumn(_tbKey, 1); g.Children.Add(_tbKey); r++;
+            var keyPanel = new StackPanel();
+            keyPanel.Children.Add(_tbKey);
+            keyPanel.Children.Add(new TextBlock
+            {
+                Text = HasSavedKey() ? "已保存 API Key，留空保持不变；填写新值可替换。" : "请输入 API Key，保存后将加密存储。",
+                Foreground = Theme.TextB, FontSize = 11, Opacity = 0.75,
+                TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 2, 0, 4)
+            });
+            Grid.SetRow(keyPanel, r); Grid.SetColumn(keyPanel, 1); g.Children.Add(keyPanel); r++;
 
             AddLabel(g, r, "模型");
             _tbModel = new TextBox { Text = "gpt-4o-mini", Margin = new Thickness(0, 3, 0, 3) };
@@ -321,9 +329,8 @@ namespace MailPulse.UI
             var btnPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 14, 0, 0) };
             var ok = Theme.CreateButton("确定", () =>
             {
-                if (string.IsNullOrWhiteSpace(_tbName.Text) || string.IsNullOrWhiteSpace(_tbBase.Text) ||
-                    string.IsNullOrWhiteSpace(_tbKey.Text) || string.IsNullOrWhiteSpace(_tbModel.Text))
-                { MessageBox.Show("名称、Base URL、API Key、模型不能为空。"); return; }
+                string error = ValidateInputs();
+                if (error != null) { MessageBox.Show(error); return; }
                 DialogResult = true;
             }, true);
             var cancel = Theme.CreateButton("取消", () => DialogResult = false);
@@ -354,6 +361,17 @@ namespace MailPulse.UI
             return Models.LlmProtocol.OpenAiChat;
         }
 
+        private bool HasSavedKey() => !string.IsNullOrWhiteSpace(
+            Services.SecureStore.Unprotect(_editing?.EncryptedApiKey));
+
+        private string ValidateInputs()
+        {
+            if (string.IsNullOrWhiteSpace(_tbName.Text) || string.IsNullOrWhiteSpace(_tbBase.Text) ||
+                string.IsNullOrWhiteSpace(_tbModel.Text)) return "名称、Base URL、模型不能为空。";
+            if (string.IsNullOrWhiteSpace(_tbKey.Text) && !HasSavedKey()) return "请输入 API Key。";
+            return null;
+        }
+
         private void AddLabel(Grid grid, int row, string text)
         {
             var l = Theme.Label(text);
@@ -367,13 +385,14 @@ namespace MailPulse.UI
             if (timeout < 3) timeout = 3;
             return new Models.LlmConfig
             {
+                Id = _editing?.Id ?? Guid.NewGuid().ToString("N"),
                 Name = _tbName.Text,
                 Protocol = FromCombo(),
                 BaseUrl = _tbBase.Text.Trim(),
                 Model = _tbModel.Text.Trim(),
-                EncryptedApiKey = string.IsNullOrEmpty(_tbKey.Text)
+                EncryptedApiKey = string.IsNullOrWhiteSpace(_tbKey.Text)
                     ? (_editing?.EncryptedApiKey ?? "")
-                    : Services.SecureStore.Protect(_tbKey.Text),
+                    : Services.SecureStore.Protect(_tbKey.Text.Trim()),
                 TimeoutSeconds = timeout,
                 Enabled = _chkEnabled.IsChecked ?? true,
             };

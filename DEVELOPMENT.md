@@ -19,7 +19,7 @@ MailPulse 是一个 **Windows 托盘常驻的邮件验证码监控工具**：
 ## 2. 仓库与发布
 
 - GitHub（公开）：https://github.com/bighamx/MailPulse
-- 发布版本：v0.2.0（含单文件 exe + exe.config，另提供 ZIP 压缩包）
+- 发布版本：v0.3.0（含单文件 exe + exe.config，另提供 ZIP 压缩包）
 - 提交作者使用 GitHub 匿名邮箱（`bighamx@users.noreply.github.com`），**避免泄漏个人邮箱**
 - **红线**：本仓库公开，任何提交不得包含真实账号、密码、API Key、`%AppData%` 下的配置/日志/seen.json
 
@@ -81,8 +81,12 @@ MailPulse/
 - 协议：OpenAI Chat（`/chat/completions`）、OpenAI Responses（`/responses`）、Anthropic（`/messages`，`x-api-key` + `anthropic-version`）
 - 提示词支持 `{subject}` / `{body}` 占位符；要求模型输出 JSON：`{is_urgent, code, url, reason}`
 - 解析容错：截取首个 `{` 到末个 `}` 再 JObject.Parse
-- 每次请求独立 `HttpRequestMessage` 带鉴权头（共享 HttpClient 防串头），统一超时（默认 8s，最小 3s）
+- 每次请求独立 `HttpRequestMessage` 带鉴权头、独立 `HttpClient/HttpClientHandler` 连接组，用完释放；后台分类与翻译不复用连接或取消生命周期，分类超时默认 8s、最小 3s
 - 仅第一个启用且含有效 Key 的配置被使用（`FirstEnabled`）
+- `LlmClient` 明确请求非流式 JSON，使用 `ResponseHeadersRead` 增量读取；完整根 JSON 到齐后立即解析，不等待网关连接结束或尾部 chunk。支持 gzip/deflate，限制响应为 4 MiB
+- 响应头与正文读取均有独立的取消竞速保障；取消时释放响应，并回收忽略取消后迟到的响应。日志仅记录请求编号、阶段、状态码、字节数及耗时，不输出正文或凭据
+- NewAPI 兼容性：显式设置 `ExpectContinue=false`、`ConnectionClose=true`，避免等待中间握手或复用异常连接。曾出现后端完成而客户端一直停留在 `stage=sending`；仅更换连接组仍有超时，关闭上述握手/复用后实测 4 轮并发分类+翻译及 3 轮真实 WPF 翻译全部完成。不能只用“新进程单次请求成功”作为验收标准
+- 编辑 LLM 配置不回显 Key；留空或仅空白保留原加密值，填写新值才替换。新增或旧 Key 无法解密时必须输入，名称/模型/超时等修改不要求重复输入有效的已保存 Key
 
 ### 4.5 通知（ToastWindow）
 - 无边框 + `AllowsTransparency`，圆角卡片 + 阴影，淡入 + 上滑动画，底部 30s 蓝色倒计时条
@@ -110,13 +114,19 @@ MailPulse/
 #### 邮件翻译
 
 - 正文加载后点击“翻译为中文”，复用第一个启用且模型/API Key 有效的 LLM 配置；不依赖验证码的 `LlmFallbackEnabled` 开关
-- `LlmClient` 共享三协议请求；分类保留原提示词和超时。翻译按约 1800 字符分段，优先段落/句子边界并保护 URL、邮箱地址、标识符和 UTF-16 代理对；每段独立等待至少 120 秒（若配置更长则沿用），最大输出 8192 tokens。主题只在首段翻译
+- `LlmClient` 共享三协议请求；分类保留原提示词和超时。纯文本邮件按约 1800 字符分段，优先段落/句子边界并保护 URL、邮箱地址、标识符和 UTF-16 代理对；每段独立等待至少 120 秒（若配置更长则沿用），最大输出 8192 tokens。主题只在首段翻译
+- **HTML 邮件原地织入排版（XLIFF 风格不透明占位符）**：`HtmlMailLayout`（HtmlAgilityPack）把正文解析成**块级翻译单元**——每个不含块级子元素的元素（`p`/`div`/`li`/`td`/`h1-h6`/`pre` 等）整体一个单元；块内每个内联元素（`<b>`/`<a>`/`<sup>`/`<img>`/`<br>` 等）变为不透明占位符 `⟦N⟧...⟦/N⟧`，整块作为一个带占位符的**模板字符串**发给 LLM（`body` 字段）。模型看到完整句子上下文，必须原样保留每个占位符（开/闭、顺序、嵌套）。回填时解析模板树并校验：占位符缺失/重复/乱序/嵌套非法 → 整段降级（去标记并入首片段），绝不写坏结构。图片/链接/表格/内联样式不丢，单元数≈段落数，首段在第一批并行请求中即完成
+- **属性翻译**：`alt`/`title`/`placeholder`/`aria-label`/`aria-description` 作为批量属性单元，一次请求发送 `attributes:[{id,text}]` 数组并等长回填（`AttributeSystemPrompt`）；`translate="no"`/`data-no-translate` 子树跳过。响应畸形时不致命、保留原值
+- **排除与净化**：`<head>/<style>/<script>/<title>/<meta>/<link>/<code>/<pre>/<svg>` 整棵子树不翻译；空白/纯标点块（如 `<p>&nbsp;</p>`）不发送。`HtmlAgilityPack` 不解码命名实体，故先 `HtmlDecode` 再折叠空白，避免字面 `&nbsp;` 被送去 LLM 又回显成正文。`<br>/<hr>` 是内联换行、不视为块容器，含 `<br>` 的脚注/页脚段落必须整段成单元（否则 sup/a 各自成段而正文文本被孤立）
+- **阅读体验**：首次完成才导航一次到织入文档，之后各段完成通过注入的 `mpApply` 脚本就地替换 `data-mp/data-frag` 标记片段的文本，不重载页面，读者滚动位置不被打断；纯文本邮件逐段合并时也保留 `ScrollViewer` 偏移
 - 只发送主题和已提取的文本正文，不发送 HTML 源码、附件、图片；邮件内容明确作为待翻译数据，不执行其中的指令
-- 译文作为纯文本显示，可切换回包含 HTML/图片的原文；不覆盖原邮件，不修改回复引用、验证码测试或服务器内容
+- 译文作为纯文本（无 HTML 时）或织入原文版式的网页（有 HTML 时）显示，可切换回原文；不覆盖原邮件，不修改回复引用、验证码测试或服务器内容
 - `MailTranslationSession` 在内存中保留已完成的段落，失败/取消后重试只请求未完成部分；更改模型、地址或 Key 时重新建立会话，提高超时时间不清除已完成部分。切换邮件/刷新后清除，不持久化邮件内容
 - 加载中显示等待动画、完成段数和本次累计等待秒数，可取消；切换邮件/账号/关闭窗口也会取消，过期响应和进度回调不能覆盖新邮件
 - 超过 24,000 字符时明确提示且不发送、不静默截断；响应被截断、格式不正确、超时或 HTTP 错误均允许重试
 - 本地超时与上游/网络取消分开提示；诊断日志只记录段号、字符数、耗时，不记录邮件内容、Key 或服务响应
+- 卡在 `stage=sending` 的含义：`headers` 日志只有在 `SendAsync` 返回后才写入，因此长时间停留在 `sending` 表示请求处于排队/建连/TLS/已发送 body/等待响应头中的某一步，不能证明请求未到达网关。net48 的 ServicePointManager 默认每主机仅 2 个连接（按 scheme+host+port 键控的 ServicePoint 共享，不按 handler 隔离），慢速或已被取消的分类请求与翻译并发时可能占满槽位；而空闲长连接被网关半关闭后复用、`Expect: 100-continue` 中间握手不被中间设备应答，都表现为无并发的单请求停滞。当前实现已按上述机制规避：每调用独立连接组、`ConnectionClose=true`、`ExpectContinue=false`。若仍需定位差异，用日志中的 requestId 与网关侧请求日志对照即可确认瓶颈在本端还是上游
+- **并行分段**：`RunParallelAsync` 是纯文本与 HTML 织入共用的并发管线——最多 3 路在途请求、每段独立 `CancelAfter` 超时、某段失败即取消其余在途请求避免在坏配置下浪费额度；已完成段保留在会话里可续传。`Progress<T>`/`HtmlTranslationProgress` 每次都携带合并快照（译文替换、未完成段保留原文），UI 首段完成即切入译文视图并随进度刷新
 
 ### 4.9 微软邮箱：推荐接入方式与踩坑记录
 
@@ -174,8 +184,8 @@ dotnet build MailPulse.csproj -c Release
 # 产物：bin\Release\net48\MailPulse.exe（+ exe.config，必需同目录）
 
 # 发布新版本
-git tag v0.2.0 && git push origin v0.2.0
-gh release create v0.2.0 "bin\Release\net48\MailPulse.exe" "bin\Release\net48\MailPulse.exe.config" --title "v0.2.0" --notes "..."
+git tag v0.3.0 && git push origin v0.3.0
+gh release create v0.3.0 "bin\Release\net48\MailPulse.exe" "bin\Release\net48\MailPulse.exe.config" --title "v0.3.0" --notes "..."
 ```
 
 > 系统需 .NET SDK（含 net48 开发包）；Win10/11 自带 .NET Framework 4.8 运行时。
@@ -189,7 +199,7 @@ gh release create v0.2.0 "bin\Release\net48\MailPulse.exe" "bin\Release\net48\Ma
 5. **PowerShell 5.1 读取无 BOM 的 UTF-8 脚本中文乱码**：给 .ps1 加 UTF-8 BOM
 6. **截图/演示模式**：临时用 `%AppData%\MailPulse\showdemo` 标记文件自动开窗（`account/rules/llm/llmcfg/toast`），用完已移除；如需复现可重新加
 7. **配置勿提交**：config.json / seen.json / logs 都在 `%AppData%`，仓库 .gitignore 已排除 `bin/ obj/ *.log seen.json publish/ *.pdb`
-8. **MailKit 4.8.0 有 NU1902 安全告警**：升级前需回归测试 IDLE/OAuth 路径
+8. **MailKit 已升至 4.16.0**（修复 NU1902 / CVE-2026-41319 STARTTLS 响应注入）；升级后 IMAP/POP3/SMTP 路径回归通过，构建无告警
 9. **UIA 对自定义模板按钮 Invoke 不可靠**：自动化测试建议直接驱动业务层，勿依赖 UI 点击
 
 ## 7. 验证方法
@@ -200,6 +210,8 @@ gh release create v0.2.0 "bin\Release\net48\MailPulse.exe" "bin\Release\net48\Ma
 4. 深色模式下检查：主界面 / 账号对话框 / 规则编辑器 / LLM 设置 / 各下拉框展开态文字可读
 5. LLM：配置后点「测试选中」应返回识别结果
 6. 邮件翻译回归：构建 Debug 后运行 `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File scripts\Test-MailTranslation.ps1`；使用本地模拟 HTTP 验证三协议、分类兼容性、分段完整性、断点重试、超时预算、异常、取消、原文切换和过期响应，不读取真实配置、不发送真实邮件。可传入 `-PreviewPath <png路径>` 和 `-ThemeMode Light/Dark` 渲染测试界面
+7. 响应读取回归包含不发送 EOF 的模拟流，以及真实本机 TCP 网关：发送完整 JSON chunk 但不发送结尾零块，连续请求三次验证仍能立即完成，并检查无 Expect 握手、Connection 关闭；覆盖 LLM 编辑保留/替换 Key 和缺失 Key 校验。测试日志隔离在构建目录的 `test-logs`，不混入真实应用日志
+8. HTML 织入回归：占位符模板（`⟦N⟧`）映射回填、占位符缺失降级、`alt/title/aria-label` 属性批量翻译、`&nbsp;` 解码与空白块排除、含 `<br>/<sup>/<a>` 的脚注段落整段成单元、真实邮件端到端翻译（`scripts\Translate-HtmlMail.ps1`，用本机 LLM 配置，产物为独立 HTML 文件）
 
 ## 8. 待办 / 路线图
 
@@ -208,4 +220,3 @@ gh release create v0.2.0 "bin\Release\net48\MailPulse.exe" "bin\Release\net48\Ma
 - [ ] Toast 打开邮件原文（深链到网页邮箱）
 - [ ] Inno Setup 安装包（桌面快捷方式、卸载、开机自启）
 - [ ] 深色模式的对话框截图补全
-- [ ] 升级 MailKit 消除 NU1902 告警并回归测试

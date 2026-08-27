@@ -33,6 +33,10 @@ namespace MailPulse.UI
         private CancellationTokenSource _translationCts;
         private Services.MailTranslation _translation;
         private Services.MailTranslationSession _translationSession;
+        private Services.HtmlMailLayout _htmlLayout;
+        private bool _htmlNavigated;
+        private bool _htmlDomReady;
+        private int _htmlAppliedCount;
         private bool _showingTranslation;
 
         public MailCenterWindow(Services.ConfigService config)
@@ -221,6 +225,19 @@ namespace MailPulse.UI
             return source as T;
         }
 
+        private static T FindDescendant<T>(DependencyObject root) where T : DependencyObject
+        {
+            if (root == null) return null;
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+            {
+                var child = VisualTreeHelper.GetChild(root, i);
+                if (child is T match) return match;
+                var found = FindDescendant<T>(child);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
         private Border BuildPreview()
         {
             var panel = new Grid();
@@ -277,6 +294,16 @@ namespace MailPulse.UI
             _htmlBody = new WebBrowser { Visibility = Visibility.Collapsed };
             _htmlBody.Navigating += HtmlBodyNavigating;
             SetBrowserSilent(_htmlBody);
+            _htmlBody.LoadCompleted += (s, e) =>
+            {
+                // The woven document finished loading: mark it ready and apply any units that
+                // completed while it was navigating, so progress is never lost to a reload.
+                if (_htmlNavigated)
+                {
+                    _htmlDomReady = true;
+                    ApplyHtmlUnitDeltas();
+                }
+            };
             _empty = new TextBlock { Text = "邮件正文将在这里显示", Foreground = Theme.TextDimB, FontSize = 14, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
             bodyGrid.Children.Add(_body); bodyGrid.Children.Add(_htmlBody); bodyGrid.Children.Add(_empty);
             Grid.SetRow(bodyGrid, 1); panel.Children.Add(bodyGrid);
@@ -489,6 +516,10 @@ namespace MailPulse.UI
             previous?.Cancel();
             _translation = null;
             _translationSession = null;
+            _htmlLayout = null;
+            _htmlNavigated = false;
+            _htmlDomReady = false;
+            _htmlAppliedCount = 0;
             _showingTranslation = false;
             if (_translationInfo != null) _translationInfo.Text = "翻译使用现有 LLM 配置，仅发送主题与文本正文。";
             UpdateTranslationActions();
@@ -534,17 +565,104 @@ namespace MailPulse.UI
 
         private void ShowTranslation()
         {
-            if (_translation == null) return;
+            ShowTranslation(false);
+        }
+
+        private void ShowTranslation(bool partial)
+        {
+            // HTML messages are translated in place inside their own document (see
+            // RenderHtmlTranslation); the text path below only handles plain-text mail.
+            if (_currentMessage != null && !string.IsNullOrWhiteSpace(_currentMessage.BodyHtml))
+            {
+                if (_htmlLayout != null)
+                    RenderHtmlTranslation(_htmlLayout.Build(), _htmlLayout.CompletedUnits, _htmlLayout.TotalUnits);
+                return;
+            }
+            // Derive the view from the session so completed segments appear progressively;
+            // a finished session's merge equals the stored full translation.
+            Services.MailTranslation view;
+            int remainingSegments = 0;
+            if (_translationSession != null &&
+                (partial || _translation == null ? _translationSession.CompletedParts : _translationSession.TotalParts) > 0)
+            {
+                view = Services.MailTranslationService.Merge(_translationSession);
+                remainingSegments = _translationSession.TotalParts - _translationSession.CompletedParts;
+            }
+            else
+            {
+                if (_translation == null) return;
+                view = _translation;
+            }
             _showingTranslation = true;
-            _subject.Text = _translation.Subject;
-            // Never render model output as HTML or overwrite the source used by reply/extraction.
+            _subject.Text = view.Subject ?? "";
             _htmlBody.Visibility = Visibility.Collapsed;
             _body.Visibility = Visibility.Visible;
-            _body.Text = _translation.Body;
-            _body.ScrollToHome();
+            if (partial)
+            {
+                // Progressive plain-text merge: keep the reader's scroll position instead of
+                // snapping to the top on every segment arrival.
+                var scroller = FindDescendant<ScrollViewer>(_body);
+                double offset = scroller?.VerticalOffset ?? 0;
+                _body.Text = view.Body ?? "";
+                if (scroller != null) scroller.ScrollToVerticalOffset(offset);
+            }
+            else
+            {
+                _body.Text = view.Body ?? "";
+                _body.ScrollToHome();
+            }
             _empty.Visibility = Visibility.Collapsed;
-            _translationInfo.Text = "简体中文 · AI 译文仅供参考；图片和原始排版请查看原文。";
+            _translationInfo.Text = remainingSegments > 0
+                ? "简体中文 · 并行翻译中，还剩 " + remainingSegments + " 段将自动补全；未完成段落暂时显示原文。"
+                : "简体中文 · AI 译文仅供参考；图片和原始排版请查看原文。";
             UpdateTranslationActions();
+        }
+
+        // Rebuilds and navigates the woven HTML document: original tags, images, links and
+        // inline styles are preserved; translated text replaces the source text in place.
+        private void RenderHtmlTranslation(string htmlDoc, int completed, int total)
+        {
+            // This (re)navigates with a fresh snapshot that already contains every completed
+            // unit, so the DOM patch bookkeeping restarts from that point.
+            _htmlNavigated = true;
+            _htmlDomReady = false;
+            _htmlAppliedCount = completed;
+            _showingTranslation = true;
+            if (_htmlLayout != null && !string.IsNullOrWhiteSpace(_htmlLayout.TranslatedSubject))
+                _subject.Text = _htmlLayout.TranslatedSubject;
+            _body.Visibility = Visibility.Collapsed;
+            _htmlBody.Visibility = Visibility.Visible;
+            _htmlBody.NavigateToString(BuildHtmlDocument(htmlDoc ?? ""));
+            _empty.Visibility = Visibility.Collapsed;
+            int remaining = total - completed;
+            _translationInfo.Text = remaining > 0
+                ? "简体中文 · 已翻译 " + completed + "/" + total + " 段，其余自动补全；图片、链接与原始排版原样保留。"
+                : "简体中文 · AI 译文 · 图片、链接与原始排版已原样保留。";
+            UpdateTranslationActions();
+        }
+
+        // Applies units completed after the last navigation to the live document, keeping the
+        // reader's scroll position (no reload). Safe to call repeatedly; already-applied units
+        // are skipped via _htmlAppliedCount.
+        private void ApplyHtmlUnitDeltas()
+        {
+            if (!_htmlDomReady || _htmlLayout == null) return;
+            int completed = _htmlLayout.CompletedUnits;
+            for (int i = _htmlAppliedCount; i < completed; i++)
+            {
+                var unit = _htmlLayout.Units[i];
+                for (int k = 0; k < unit.Fragments.Count; k++)
+                {
+                    var fragment = unit.Fragments[k];
+                    if (fragment.Translation == null) continue;
+                    try
+                    {
+                        _htmlBody.InvokeScript("mpApply", new object[] { i, k, fragment.Translation });
+                    }
+                    catch { return; } // document not ready; retried on the next load/delta
+                }
+                _htmlAppliedCount = i + 1;
+            }
         }
 
         private async Task TranslateCurrentAsync()
@@ -562,6 +680,7 @@ namespace MailPulse.UI
                 return;
             }
 
+            bool isHtml = !string.IsNullOrWhiteSpace(message.BodyHtml);
             var operation = CancellationTokenSource.CreateLinkedTokenSource(messageOperation.Token);
             _translationCts = operation;
             UpdateTranslationActions();
@@ -577,23 +696,79 @@ namespace MailPulse.UI
             timer.Tick += (s, e) => updateProgress();
             try
             {
-                if (_translationSession == null || !_translationSession.MatchesConfiguration(cfg))
-                    _translationSession = _translator.CreateSession(message.Subject, message.Body, cfg);
-                completedParts = _translationSession.CompletedParts;
-                totalParts = _translationSession.TotalParts;
-                var progress = new Progress<Services.MailTranslationProgress>(value =>
+                if (isHtml)
                 {
-                    completedParts = value.CompletedParts;
-                    totalParts = value.TotalParts;
+                    if (_htmlLayout == null) _htmlLayout = Services.HtmlMailLayout.Parse(message.BodyHtml);
+                    completedParts = _htmlLayout.CompletedUnits;
+                    totalParts = _htmlLayout.TotalUnits;
+                    var htmlProgress = new Progress<Services.HtmlTranslationProgress>(value =>
+                    {
+                        completedParts = value.CompletedUnits;
+                        totalParts = value.TotalUnits;
+                        updateProgress();
+                        if (!ReferenceEquals(_translationCts, operation) || operation.IsCancellationRequested ||
+                            !ReferenceEquals(_currentMessage, message) || value == null || value.CompletedUnits <= 0) return;
+                        if (!_htmlNavigated)
+                        {
+                            // First completion: switch to the woven document once.
+                            _htmlNavigated = true;
+                            _htmlDomReady = false;
+                            _htmlAppliedCount = value.CompletedUnits;
+                            RenderHtmlTranslation(value.HtmlSnapshot, value.CompletedUnits, value.TotalUnits);
+                        }
+                        else
+                        {
+                            // Later completions patch the loaded document in place (mpApply),
+                            // preserving the reader's scroll position.
+                            ApplyHtmlUnitDeltas();
+                        }
+                    });
                     updateProgress();
-                });
-                updateProgress();
-                timer.Start();
-                var translated = await _translator.TranslateAsync(_translationSession, operation.Token, progress);
-                operation.Token.ThrowIfCancellationRequested();
-                if (!ReferenceEquals(_translationCts, operation) || !ReferenceEquals(_currentMessage, message)) return;
-                _translation = translated;
-                ShowTranslation();
+                    timer.Start();
+                    string woven = await _translator.TranslateHtmlAsync(_htmlLayout, message.Subject, cfg,
+                        operation.Token, htmlProgress);
+                    operation.Token.ThrowIfCancellationRequested();
+                    if (!ReferenceEquals(_translationCts, operation) || !ReferenceEquals(_currentMessage, message)) return;
+                    _translation = new Services.MailTranslation
+                    {
+                        Subject = _htmlLayout.TranslatedSubject ?? message.Subject,
+                        Body = "" // html translations render in the web view, not the text box
+                    };
+                    if (_htmlNavigated)
+                    {
+                        // The live document already has every unit patched in place; just mark
+                        // completion and refresh the caption instead of reloading (keeps scroll).
+                        ApplyHtmlUnitDeltas();
+                        if (_htmlLayout != null && !string.IsNullOrWhiteSpace(_htmlLayout.TranslatedSubject))
+                            _subject.Text = _htmlLayout.TranslatedSubject;
+                        _translationInfo.Text = "简体中文 · AI 译文 · 图片、链接与原始排版已原样保留。";
+                        UpdateTranslationActions();
+                    }
+                    else RenderHtmlTranslation(woven, _htmlLayout.TotalUnits, _htmlLayout.TotalUnits);
+                }
+                else
+                {
+                    if (_translationSession == null || !_translationSession.MatchesConfiguration(cfg))
+                        _translationSession = _translator.CreateSession(message.Subject, message.Body, cfg);
+                    completedParts = _translationSession.CompletedParts;
+                    totalParts = _translationSession.TotalParts;
+                    var progress = new Progress<Services.MailTranslationProgress>(value =>
+                    {
+                        completedParts = value.CompletedParts;
+                        totalParts = value.TotalParts;
+                        updateProgress();
+                        if (!ReferenceEquals(_translationCts, operation) || operation.IsCancellationRequested ||
+                            !ReferenceEquals(_currentMessage, message) || value == null || value.CompletedParts <= 0) return;
+                        ShowTranslation(partial: true);
+                    });
+                    updateProgress();
+                    timer.Start();
+                    var translated = await _translator.TranslateAsync(_translationSession, operation.Token, progress);
+                    operation.Token.ThrowIfCancellationRequested();
+                    if (!ReferenceEquals(_translationCts, operation) || !ReferenceEquals(_currentMessage, message)) return;
+                    _translation = translated;
+                    ShowTranslation();
+                }
             }
             catch (OperationCanceledException)
             {
@@ -603,7 +778,18 @@ namespace MailPulse.UI
             catch (Exception ex)
             {
                 if (!ReferenceEquals(_translationCts, operation) || operation.IsCancellationRequested) return;
+                // Restore controls before opening a modal error dialog (which may be obscured by another window).
+                timer.Stop();
+                _translationCts = null;
+                UpdateTranslationActions();
                 _translationInfo.Text = "翻译未完成，已完成的段落保留，点击翻译按钮可重试。";
+                if (_showingTranslation)
+                {
+                    if (isHtml && _htmlLayout != null)
+                        RenderHtmlTranslation(_htmlLayout.Build(), _htmlLayout.CompletedUnits, _htmlLayout.TotalUnits);
+                    else if (_translationSession != null) ShowTranslation(partial: true);
+                }
+                Services.Logger.Warn("mail translation ui failed: " + ex.GetType().Name + ": " + ex.Message);
                 MessageBox.Show(this, "翻译失败：\n" + ex.Message, "邮件翻译", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
             finally
@@ -726,6 +912,35 @@ namespace MailPulse.UI
 
         private static string BuildHtmlDocument(string html)
         {
+            html = SanitizeMailHtml(html);
+            string background = ColorHex(Theme.Surface);
+            string foreground = ColorHex(Theme.Text);
+            string accent = ColorHex(Theme.Accent);
+            string style = DocumentStyle(background, foreground, accent);
+            // mpApply lets the app patch translated blocks in the already-loaded document
+            // (see data-mp markers written by HtmlMailLayout) so the reader keeps scroll
+            // position while segments arrive.
+            const string script = "<script>function mpApply(i,k,t){var el=document.querySelector('[data-mp=\\\"'+i+'\\\"][data-frag=\\\"'+k+'\\\"]');" +
+                "if(!el)return;el.textContent=t;}</script>";
+            string body = html + script;
+            if (Regex.IsMatch(html, "<head[^>]*>", RegexOptions.IgnoreCase))
+                return Regex.Replace(body, "<head([^>]*)>", "<head$1>" + style, RegexOptions.IgnoreCase);
+            return "<!doctype html><html><head>" + style + "</head><body>" + body + "</body></html>";
+        }
+
+        private static string DocumentStyle(string background, string foreground, string accent)
+        {
+            return "<meta charset=\"utf-8\"><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">" +
+                "<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">" +
+                "<style>html,body{margin:0;padding:0;background:" + background + ";color:" + foreground +
+                ";font-family:'Segoe UI','Microsoft YaHei',sans-serif;font-size:14px;line-height:1.6;}" +
+                "body{padding:10px 12px;box-sizing:border-box;overflow-wrap:anywhere;}" +
+                "img{max-width:100%;height:auto;}a{color:" + accent + ";text-decoration:none;}" +
+                "a:hover{text-decoration:underline;}table{max-width:100%;}pre{white-space:pre-wrap;}</style>";
+        }
+
+        private static string SanitizeMailHtml(string html)
+        {
             html = html ?? "";
             html = Regex.Replace(html, "<script[\\s\\S]*?</script>|<iframe[\\s\\S]*?</iframe>|<object[\\s\\S]*?</object>|<embed[^>]*>",
                 "", RegexOptions.IgnoreCase);
@@ -738,20 +953,7 @@ namespace MailPulse.UI
             html = Regex.Replace(html, "<meta[^>]+charset\\s*=\\s*[^>]+>", "", RegexOptions.IgnoreCase);
             html = Regex.Replace(html, "<meta[^>]+http-equiv\\s*=\\s*['\"]?content-type['\"]?[^>]*>",
                 "", RegexOptions.IgnoreCase);
-
-            string background = ColorHex(Theme.Surface);
-            string foreground = ColorHex(Theme.Text);
-            string accent = ColorHex(Theme.Accent);
-            string style = "<meta charset=\"utf-8\"><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">" +
-                "<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">" +
-                "<style>html,body{margin:0;padding:0;background:" + background + ";color:" + foreground +
-                ";font-family:'Segoe UI','Microsoft YaHei',sans-serif;font-size:14px;line-height:1.6;}" +
-                "body{padding:10px 12px;box-sizing:border-box;overflow-wrap:anywhere;}" +
-                "img{max-width:100%;height:auto;}a{color:" + accent + ";text-decoration:none;}" +
-                "a:hover{text-decoration:underline;}table{max-width:100%;}pre{white-space:pre-wrap;}</style>";
-            if (Regex.IsMatch(html, "<head[^>]*>", RegexOptions.IgnoreCase))
-                return Regex.Replace(html, "<head([^>]*)>", "<head$1>" + style, RegexOptions.IgnoreCase);
-            return "<!doctype html><html><head>" + style + "</head><body>" + html + "</body></html>";
+            return html;
         }
 
         private static string ColorHex(Color color)
