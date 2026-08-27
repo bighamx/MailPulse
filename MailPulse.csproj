@@ -7,7 +7,7 @@
     <LangVersion>7.3</LangVersion>
     <RootNamespace>MailPulse</RootNamespace>
     <AssemblyName>MailPulse</AssemblyName>
-    <Version>0.3.0</Version>
+    <Version>0.3.1</Version>
     <ApplicationIcon>Assets\MailPulse.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>

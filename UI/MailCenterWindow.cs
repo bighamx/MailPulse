@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
@@ -36,7 +37,8 @@ namespace MailPulse.UI
         private Services.HtmlMailLayout _htmlLayout;
         private bool _htmlNavigated;
         private bool _htmlDomReady;
-        private int _htmlAppliedCount;
+        private readonly HashSet<int> _htmlAppliedUnits = new HashSet<int>();
+        private readonly HashSet<int> _htmlAppliedAttributes = new HashSet<int>();
         private bool _showingTranslation;
 
         public MailCenterWindow(Services.ConfigService config)
@@ -519,7 +521,8 @@ namespace MailPulse.UI
             _htmlLayout = null;
             _htmlNavigated = false;
             _htmlDomReady = false;
-            _htmlAppliedCount = 0;
+            _htmlAppliedUnits.Clear();
+            _htmlAppliedAttributes.Clear();
             _showingTranslation = false;
             if (_translationInfo != null) _translationInfo.Text = "翻译使用现有 LLM 配置，仅发送主题与文本正文。";
             UpdateTranslationActions();
@@ -532,6 +535,7 @@ namespace MailPulse.UI
             Theme.SetButtonLoading(_translate, busy, "翻译中…");
             _translate.IsEnabled = _currentMessage != null;
             if (!busy) _translate.Content = _translation != null ? "查看译文" :
+                _htmlLayout != null && _htmlLayout.CompletedJobs > 0 ? "继续翻译" :
                 _translationSession != null && _translationSession.CompletedParts > 0 ? "继续翻译" : "翻译为中文";
             _translationAlternate.Content = busy ? "取消翻译" : "查看原文";
             _translationAlternate.Visibility = busy || _showingTranslation ? Visibility.Visible : Visibility.Collapsed;
@@ -542,6 +546,10 @@ namespace MailPulse.UI
             var message = _currentMessage;
             if (message == null) return;
             _showingTranslation = false;
+            _htmlNavigated = false;
+            _htmlDomReady = false;
+            _htmlAppliedUnits.Clear();
+            _htmlAppliedAttributes.Clear();
             _subject.Text = message.Subject;
             if (!string.IsNullOrWhiteSpace(message.BodyHtml))
             {
@@ -575,7 +583,7 @@ namespace MailPulse.UI
             if (_currentMessage != null && !string.IsNullOrWhiteSpace(_currentMessage.BodyHtml))
             {
                 if (_htmlLayout != null)
-                    RenderHtmlTranslation(_htmlLayout.Build(), _htmlLayout.CompletedUnits, _htmlLayout.TotalUnits);
+                    RenderHtmlTranslation(_htmlLayout.Build(), _htmlLayout.CompletedJobs, _htmlLayout.TotalJobs);
                 return;
             }
             // Derive the view from the session so completed segments appear progressively;
@@ -626,7 +634,10 @@ namespace MailPulse.UI
             // unit, so the DOM patch bookkeeping restarts from that point.
             _htmlNavigated = true;
             _htmlDomReady = false;
-            _htmlAppliedCount = completed;
+            // Snapshot completion counts are not contiguous indexes. Reapply every completed
+            // ID after navigation; patches are idempotent, including completions during loading.
+            _htmlAppliedUnits.Clear();
+            _htmlAppliedAttributes.Clear();
             _showingTranslation = true;
             if (_htmlLayout != null && !string.IsNullOrWhiteSpace(_htmlLayout.TranslatedSubject))
                 _subject.Text = _htmlLayout.TranslatedSubject;
@@ -641,27 +652,46 @@ namespace MailPulse.UI
             UpdateTranslationActions();
         }
 
-        // Applies units completed after the last navigation to the live document, keeping the
-        // reader's scroll position (no reload). Safe to call repeatedly; already-applied units
-        // are skipped via _htmlAppliedCount.
+        // Completion order is arbitrary. Track successful patches by ID, never by count.
         private void ApplyHtmlUnitDeltas()
         {
             if (!_htmlDomReady || _htmlLayout == null) return;
-            int completed = _htmlLayout.CompletedUnits;
-            for (int i = _htmlAppliedCount; i < completed; i++)
+            ApplyHtmlUnitDeltas(
+                (i, k, text) => TryApplyHtmlScript("mpApply", i, k, text),
+                (i, name, text) => TryApplyHtmlScript("mpApplyAttribute", i, name, text));
+        }
+
+        private bool TryApplyHtmlScript(string function, params object[] args)
+        {
+            try { return Equals(_htmlBody.InvokeScript(function, args), true); }
+            catch { return false; } // A loading document is retried on LoadCompleted/next delta.
+        }
+
+        private void ApplyHtmlUnitDeltas(Func<int, int, string, bool> applyText,
+            Func<int, string, string, bool> applyAttribute)
+        {
+            var layout = _htmlLayout;
+            if (layout == null) return;
+            lock (layout)
             {
-                var unit = _htmlLayout.Units[i];
-                for (int k = 0; k < unit.Fragments.Count; k++)
+                for (int i = 0; i < layout.Units.Count; i++)
                 {
-                    var fragment = unit.Fragments[k];
-                    if (fragment.Translation == null) continue;
-                    try
-                    {
-                        _htmlBody.InvokeScript("mpApply", new object[] { i, k, fragment.Translation });
-                    }
-                    catch { return; } // document not ready; retried on the next load/delta
+                    var unit = layout.Units[i];
+                    if (!unit.Done || _htmlAppliedUnits.Contains(i)) continue;
+                    for (int k = 0; k < unit.Fragments.Count; k++)
+                        if (!applyText(i, k, unit.Fragments[k].Translation)) return;
+                    _htmlAppliedUnits.Add(i);
                 }
-                _htmlAppliedCount = i + 1;
+                if (layout.AttributesDone)
+                {
+                    for (int i = 0; i < layout.Attributes.Count; i++)
+                    {
+                        if (_htmlAppliedAttributes.Contains(i)) continue;
+                        var attribute = layout.Attributes[i];
+                        if (!applyAttribute(i, attribute.Name, attribute.Translated)) return;
+                        _htmlAppliedAttributes.Add(i);
+                    }
+                }
             }
         }
 
@@ -699,8 +729,8 @@ namespace MailPulse.UI
                 if (isHtml)
                 {
                     if (_htmlLayout == null) _htmlLayout = Services.HtmlMailLayout.Parse(message.BodyHtml);
-                    completedParts = _htmlLayout.CompletedUnits;
-                    totalParts = _htmlLayout.TotalUnits;
+                    completedParts = _htmlLayout.CompletedJobs;
+                    totalParts = _htmlLayout.TotalJobs;
                     var htmlProgress = new Progress<Services.HtmlTranslationProgress>(value =>
                     {
                         completedParts = value.CompletedUnits;
@@ -713,7 +743,6 @@ namespace MailPulse.UI
                             // First completion: switch to the woven document once.
                             _htmlNavigated = true;
                             _htmlDomReady = false;
-                            _htmlAppliedCount = value.CompletedUnits;
                             RenderHtmlTranslation(value.HtmlSnapshot, value.CompletedUnits, value.TotalUnits);
                         }
                         else
@@ -721,6 +750,8 @@ namespace MailPulse.UI
                             // Later completions patch the loaded document in place (mpApply),
                             // preserving the reader's scroll position.
                             ApplyHtmlUnitDeltas();
+                            _translationInfo.Text = "简体中文 · 已翻译 " + value.CompletedUnits + "/" + value.TotalUnits +
+                                " 段；未完成内容暂时保留原文。";
                         }
                     });
                     updateProgress();
@@ -744,7 +775,7 @@ namespace MailPulse.UI
                         _translationInfo.Text = "简体中文 · AI 译文 · 图片、链接与原始排版已原样保留。";
                         UpdateTranslationActions();
                     }
-                    else RenderHtmlTranslation(woven, _htmlLayout.TotalUnits, _htmlLayout.TotalUnits);
+                    else RenderHtmlTranslation(woven, _htmlLayout.TotalJobs, _htmlLayout.TotalJobs);
                 }
                 else
                 {
@@ -786,7 +817,7 @@ namespace MailPulse.UI
                 if (_showingTranslation)
                 {
                     if (isHtml && _htmlLayout != null)
-                        RenderHtmlTranslation(_htmlLayout.Build(), _htmlLayout.CompletedUnits, _htmlLayout.TotalUnits);
+                        RenderHtmlTranslation(_htmlLayout.Build(), _htmlLayout.CompletedJobs, _htmlLayout.TotalJobs);
                     else if (_translationSession != null) ShowTranslation(partial: true);
                 }
                 Services.Logger.Warn("mail translation ui failed: " + ex.GetType().Name + ": " + ex.Message);
@@ -921,7 +952,9 @@ namespace MailPulse.UI
             // (see data-mp markers written by HtmlMailLayout) so the reader keeps scroll
             // position while segments arrive.
             const string script = "<script>function mpApply(i,k,t){var el=document.querySelector('[data-mp=\\\"'+i+'\\\"][data-frag=\\\"'+k+'\\\"]');" +
-                "if(!el)return;el.textContent=t;}</script>";
+                "if(!el)return false;el.textContent=t;return true;}" +
+                "function mpApplyAttribute(i,n,t){var el=document.querySelector('[data-mp-attr-'+i+']');" +
+                "if(!el)return false;el.setAttribute(n,t);return true;}</script>";
             string body = html + script;
             if (Regex.IsMatch(html, "<head[^>]*>", RegexOptions.IgnoreCase))
                 return Regex.Replace(body, "<head([^>]*)>", "<head$1>" + style, RegexOptions.IgnoreCase);

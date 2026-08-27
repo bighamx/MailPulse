@@ -7,8 +7,8 @@ using HtmlAgilityPack;
 namespace MailPulse.Services
 {
     // Localizes an HTML document with an XLIFF-style model: the LLM only ever sees plain text
-    // interleaved with opaque inline placeholders (⟦N⟧...⟦/N⟧). One unit is a leaf block
-    // (p/div/li/td/h1-h6/pre/... with no nested block element). Inside a block, every inline
+    // interleaved with opaque inline placeholders (⟦N⟧...⟦/N⟧). One unit is an inline/text
+    // run between block boundaries, including runs around nested blocks. Every inline
     // element becomes a placeholder and the whole block is sent as a single template string,
     // so the model has full sentence context (no fragmented per-text-node requests).
     // On completion the returned template is parsed, validated (placeholders complete,
@@ -58,12 +58,14 @@ namespace MailPulse.Services
         internal sealed class Unit
         {
             internal readonly HtmlNode Block;
+            internal readonly List<HtmlNode> Roots;
             internal readonly List<Fragment> Fragments = new List<Fragment>();
             internal readonly List<HtmlNode> Placeholders = new List<HtmlNode>();
             internal string Template;
             internal string Translation;
             internal bool Done => Translation != null;
-            internal Unit(HtmlNode block) { Block = block; }
+            internal Unit(HtmlNode block, IEnumerable<HtmlNode> roots)
+            { Block = block; Roots = roots.ToList(); }
         }
 
         internal readonly HtmlDocument Document;
@@ -83,12 +85,12 @@ namespace MailPulse.Services
             TotalUnits = units.Count;
         }
 
-        public int CompletedUnits => Units.Count(u => u.Done);
+        public int CompletedUnits { get { lock (this) return Units.Count(u => u.Done); } }
         public bool HasAttributes => Attributes.Count > 0;
         public int AttributeCount => Attributes.Count;
         // Text units plus one batched attribute job.
         public int TotalJobs => Units.Count + (HasAttributes ? 1 : 0);
-        public int CompletedJobs => Units.Count(u => u.Done) + (AttributesDone ? 1 : 0);
+        public int CompletedJobs { get { lock (this) return Units.Count(u => u.Done) + (AttributesDone ? 1 : 0); } }
 
         public static HtmlMailLayout Parse(string bodyHtml)
         {
@@ -96,41 +98,49 @@ namespace MailPulse.Services
                 throw new InvalidOperationException("这封邮件没有可翻译的 HTML 正文。");
             var document = new HtmlDocument { OptionFixNestedTags = true, OptionOutputAsXml = false };
             document.LoadHtml(bodyHtml);
-            var qualified = new HashSet<HtmlNode>();
-            foreach (var element in AllElementsInDocumentOrder(document.DocumentNode))
-                if (IsLeafBlock(element)) qualified.Add(element);
-
             var units = new List<Unit>();
             var texts = new List<string>();
-            foreach (var element in AllElementsInDocumentOrder(document.DocumentNode))
-            {
-                if (!qualified.Contains(element)) continue;
-                // Skip inline elements whose ancestor is already a unit, and anything inside
-                // non-translatable subtrees (head/style/script/...).
-                var parent = element.ParentNode;
-                bool nested = false;
-                while (parent != null)
-                {
-                    if (qualified.Contains(parent) || SkipTags.Contains(parent.Name)) { nested = true; break; }
-                    parent = parent.ParentNode;
-                }
-                if (nested) continue;
-                var unit = new Unit(element);
-                var sb = new StringBuilder();
-                BuildTemplate(element, unit, sb);
-                string template = sb.ToString();
-                if (!RegexHasText(template)) continue; // whitespace-only / garbage blocks skipped
-                unit.Template = template;
-                if (unit.Fragments.Count == 0) continue;
-                units.Add(unit);
-                texts.Add(template);
-            }
-            if (units.Count == 0)
-                throw new InvalidOperationException("这封邮件没有可翻译的文本内容。");
+            CollectUnits(document.DocumentNode, units, texts);
             var layout = new HtmlMailLayout(document, units, texts);
             CollectAttributes(document, layout);
+            if (layout.TotalJobs == 0)
+                throw new InvalidOperationException("这封邮件没有可翻译的文本内容。");
             layout.EnsureSpans();
             return layout;
+        }
+
+        // Split at block boundaries, but retain the inline/text runs before and after them.
+        // Roots are references to the original nodes: no wrapper/reparenting changes layout.
+        private static void CollectUnits(HtmlNode container, List<Unit> units, List<string> texts)
+        {
+            if (IsNoTranslateOrSkipped(container)) return;
+            var roots = new List<HtmlNode>();
+            foreach (var child in container.ChildNodes)
+            {
+                bool boundary = child.NodeType == HtmlNodeType.Element &&
+                    (BlockTags.Contains(child.Name) || child.Descendants().Any(n =>
+                        n.NodeType == HtmlNodeType.Element && BlockTags.Contains(n.Name)));
+                if (boundary)
+                {
+                    AddUnit(container, roots, units, texts);
+                    roots.Clear();
+                    CollectUnits(child, units, texts);
+                }
+                else roots.Add(child);
+            }
+            AddUnit(container, roots, units, texts);
+        }
+
+        private static void AddUnit(HtmlNode container, List<HtmlNode> roots, List<Unit> units, List<string> texts)
+        {
+            if (roots.Count == 0) return;
+            var unit = new Unit(container, roots);
+            var sb = new StringBuilder();
+            BuildTemplate(unit.Roots, unit, sb);
+            if (!unit.Fragments.Any(f => RegexHasText(f.Source))) return;
+            unit.Template = sb.ToString();
+            units.Add(unit);
+            texts.Add(unit.Template);
         }
 
         // Alt/title/placeholder/aria-* attribute values are user-visible text and are translated
@@ -173,30 +183,13 @@ namespace MailPulse.Services
             return System.Text.RegularExpressions.Regex.Replace(raw, "[\\s\\u00A0\\u2000-\\u200A\\u202F\\u205F]+", " ").Trim();
         }
 
-        private static bool IsLeafBlock(HtmlNode element)
-        {
-            if (element.NodeType != HtmlNodeType.Element) return false;
-            if (SkipTags.Contains(element.Name)) return false;
-            foreach (var descendant in element.Descendants())
-                if (descendant.NodeType == HtmlNodeType.Element && BlockTags.Contains(descendant.Name)) return false;
-            return HasText(element);
-        }
-
-        private static bool HasText(HtmlNode element)
-        {
-            foreach (var descendant in element.DescendantsAndSelf())
-                if (descendant.NodeType == HtmlNodeType.Text && !string.IsNullOrWhiteSpace(descendant.InnerText))
-                    return true;
-            return false;
-        }
-
         // Builds the block's template: text runs become fragments, every inline element becomes
         // a placeholder (⟦id⟧...⟦/id⟧) and its own content is recursed, so nested markup yields
         // nested placeholders. Placeholder ids are assigned in document (DFS) order.
-        private static void BuildTemplate(HtmlNode container, Unit unit, StringBuilder sb)
+        private static void BuildTemplate(IEnumerable<HtmlNode> children, Unit unit, StringBuilder sb)
         {
             var run = new List<HtmlTextNode>();
-            foreach (var child in container.ChildNodes)
+            foreach (var child in children)
             {
                 if (child.NodeType == HtmlNodeType.Text)
                 {
@@ -205,11 +198,11 @@ namespace MailPulse.Services
                 else if (child.NodeType == HtmlNodeType.Element)
                 {
                     FlushRun(run, unit, sb);
-                    if (SkipTags.Contains(child.Name)) continue;
+                    if (IsNoTranslateOrSkipped(child)) continue;
                     int id = unit.Placeholders.Count;
                     unit.Placeholders.Add(child);
                     sb.Append(Open).Append(id).Append(Close);
-                    BuildTemplate(child, unit, sb);
+                    BuildTemplate(child.ChildNodes, unit, sb);
                     sb.Append(Open).Append('/').Append(id).Append(Close);
                 }
             }
@@ -220,7 +213,7 @@ namespace MailPulse.Services
         {
             if (run.Count == 0) return;
             string source = CleanText(run);
-            if (source.Length == 0) return;
+            if (source.Length == 0) { run.Clear(); return; }
             // Copy: the shared run list is cleared below, and each fragment must keep its own nodes.
             unit.Fragments.Add(new Fragment(new List<HtmlTextNode>(run), source));
             sb.Append(source);
@@ -268,7 +261,6 @@ namespace MailPulse.Services
             for (int i = 0; i < Units.Count; i++)
             {
                 var unit = Units[i];
-                unit.Block.SetAttributeValue("data-mp", i.ToString());
                 for (int k = 0; k < unit.Fragments.Count; k++)
                 {
                     var fragment = unit.Fragments[k];
@@ -276,23 +268,34 @@ namespace MailPulse.Services
                     span.InnerHtml = System.Net.WebUtility.HtmlEncode(fragment.Source);
                     var first = fragment.Nodes[0];
                     first.ParentNode.InsertBefore(span, first);
+                    int rootIndex = unit.Roots.IndexOf(first);
+                    if (rootIndex >= 0)
+                    {
+                        foreach (var node in fragment.Nodes) unit.Roots.Remove(node);
+                        unit.Roots.Insert(rootIndex, span);
+                    }
                     foreach (var node in fragment.Nodes) node.Remove();
                     fragment.Span = span;
                 }
             }
+            for (int i = 0; i < Attributes.Count; i++)
+                Attributes[i].Element.SetAttributeValue("data-mp-attr-" + i, "");
         }
 
         internal string Build()
         {
-            EnsureSpans();
-            for (int i = 0; i < Units.Count; i++)
-                foreach (var fragment in Units[i].Fragments)
-                    if (fragment.Translation != null)
-                        fragment.Span.InnerHtml = System.Net.WebUtility.HtmlEncode(fragment.Translation);
-            foreach (var attribute in Attributes)
-                if (attribute.Translated != null)
-                    attribute.Element.SetAttributeValue(attribute.Name, attribute.Translated);
-            return Document.DocumentNode.OuterHtml;
+            lock (this)
+            {
+                EnsureSpans();
+                for (int i = 0; i < Units.Count; i++)
+                    foreach (var fragment in Units[i].Fragments)
+                        if (fragment.Translation != null)
+                            fragment.Span.InnerHtml = System.Net.WebUtility.HtmlEncode(fragment.Translation);
+                foreach (var attribute in Attributes)
+                    if (attribute.Translated != null)
+                        attribute.Element.SetAttributeValue(attribute.Name, System.Net.WebUtility.HtmlEncode(attribute.Translated));
+                return Document.DocumentNode.OuterHtml;
+            }
         }
 
         // Applies a translated template to a unit. Throws when placeholders are missing,
@@ -301,7 +304,7 @@ namespace MailPulse.Services
         {
             var tree = ParseTemplate(translated, unit.Placeholders.Count);
             int fragIndex = 0, phIndex = 0;
-            Walk(unit.Block, tree, unit, ref fragIndex, ref phIndex);
+            Walk(unit.Roots, tree, unit, ref fragIndex, ref phIndex);
             if (fragIndex != unit.Fragments.Count || phIndex != unit.Placeholders.Count)
                 throw new InvalidOperationException("占位符结构不完整。");
             unit.Translation = translated;
@@ -375,12 +378,13 @@ namespace MailPulse.Services
             return root;
         }
 
-        private static void Walk(HtmlNode element, TNode tnode, Unit unit, ref int fragIndex, ref int phIndex)
+        private static void Walk(IEnumerable<HtmlNode> children, TNode tnode, Unit unit, ref int fragIndex, ref int phIndex)
         {
             int pi = 0;
-            foreach (var child in element.ChildNodes)
+            foreach (var child in children)
             {
                 if (child.NodeType != HtmlNodeType.Element) continue;
+                if (IsNoTranslateOrSkipped(child)) continue;
                 if (child.Attributes.Contains("data-frag"))
                 {
                     // Fragment marker span: consumes the next plain-text part.
@@ -399,7 +403,7 @@ namespace MailPulse.Services
                         throw new InvalidOperationException("占位符顺序错乱。");
                     var inner = tnode.Parts[pi].Inner;
                     pi++;
-                    Walk(child, inner, unit, ref fragIndex, ref phIndex);
+                    Walk(child.ChildNodes, inner, unit, ref fragIndex, ref phIndex);
                 }
             }
             if (pi != tnode.Parts.Count)

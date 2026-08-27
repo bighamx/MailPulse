@@ -69,7 +69,7 @@
 
 发布产物为单文件（依赖已内嵌）：
 
-1. 从 [Releases](../../releases) 下载 `MailPulse.exe`（或自行构建）
+1. 从 [Releases](../../releases) 下载 ZIP 包并完整解压，确保 `MailPulse.exe` 与 `MailPulse.exe.config` 位于同一目录（或自行构建）
 2. 双击运行，首次启动自动打开主界面
 3. 添加邮箱账号（选预设 → 填邮箱与密码/授权码 → 测试连接）
 4. 等待验证码邮件，右下角自动弹出通知

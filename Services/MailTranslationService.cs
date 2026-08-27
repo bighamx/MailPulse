@@ -109,8 +109,8 @@ namespace MailPulse.Services
                         "; elapsedMs=" + elapsed.ElapsedMilliseconds);
                     progress?.Report(CreateProgress(session, seconds));
                 }).ConfigureAwait(false);
-                RaiseFailureIfAny(failures, session.TotalParts, seconds);
                 token.ThrowIfCancellationRequested();
+                RaiseFailureIfAny(failures, session.TotalParts, session.CompletedParts);
                 return Merge(session);
             }
             finally { session.Gate.Release(); }
@@ -133,7 +133,7 @@ namespace MailPulse.Services
             if (attrJobIndex >= 0 && !layout.AttributesDone) pending.Add(attrJobIndex);
             if (pending.Count == 0) return layout.Build();
             token.ThrowIfCancellationRequested();
-            progress?.Report(new HtmlTranslationProgress(layout.CompletedJobs, layout.TotalJobs, seconds, layout.Build()));
+            progress?.Report(CreateHtmlProgress(layout, seconds));
             await RunParallelAsync(pending, seconds, token, failures, async (index, timeout) =>
             {
                 var elapsed = Stopwatch.StartNew();
@@ -145,12 +145,17 @@ namespace MailPulse.Services
                 {
                     await TranslateAttributeBatchAsync(layout, cfg, elapsed, timeout).ConfigureAwait(false);
                 }
-                progress?.Report(new HtmlTranslationProgress(layout.CompletedJobs, layout.TotalJobs, seconds,
-                    layout.Build()));
+                progress?.Report(CreateHtmlProgress(layout, seconds));
             }).ConfigureAwait(false);
-            RaiseFailureIfAny(failures, layout.TotalJobs, seconds);
             token.ThrowIfCancellationRequested();
+            RaiseFailureIfAny(failures, layout.TotalJobs, layout.CompletedJobs);
             return layout.Build();
+        }
+
+        private static HtmlTranslationProgress CreateHtmlProgress(HtmlMailLayout layout, int seconds)
+        {
+            lock (layout)
+                return new HtmlTranslationProgress(layout.CompletedJobs, layout.TotalJobs, seconds, layout.Build());
         }
 
         private static async Task TranslateTextUnitAsync(HtmlMailLayout layout, int index, string subject,
@@ -203,27 +208,31 @@ namespace MailPulse.Services
                 timeout.ThrowIfCancellationRequested();
                 var json = JObject.Parse(raw);
                 var arr = json["attributes"] as JArray;
+                if (arr == null || arr.Count != layout.Attributes.Count) throw new JsonException();
+                var translated = new Dictionary<int, string>();
+                foreach (var item in arr)
+                {
+                    if (!(item is JObject) || item["id"]?.Type != JTokenType.Integer ||
+                        item["text"]?.Type != JTokenType.String) throw new JsonException();
+                    int id = item.Value<int>("id");
+                    string text = NormalizeTranslationText(item.Value<string>("text"));
+                    if (id < 0 || id >= layout.Attributes.Count || translated.ContainsKey(id) ||
+                        string.IsNullOrWhiteSpace(text)) throw new JsonException();
+                    translated.Add(id, text);
+                }
+                timeout.ThrowIfCancellationRequested();
                 lock (layout)
                 {
-                    if (arr != null)
-                    {
-                        foreach (var item in arr)
-                        {
-                            int id = item.Value<int?>("id") ?? -1;
-                            string text = item.Value<string>("text");
-                            if (id >= 0 && id < layout.Attributes.Count && text != null)
-                                layout.Attributes[id].Translated = NormalizeTranslationText(text);
-                        }
-                    }
+                    // Commit only a complete validated batch; cancelled/failed jobs remain retryable.
+                    foreach (var item in translated) layout.Attributes[item.Key].Translated = item.Value;
                     layout.AttributesDone = true;
                 }
                 Logger.Info("html attribute batch completed; count=" + layout.Attributes.Count +
                     "; elapsedMs=" + elapsed.ElapsedMilliseconds);
             }
-            catch
+            catch (JsonException)
             {
-                // A malformed attribute response is non-fatal: keep original attribute values.
-                lock (layout) { layout.AttributesDone = true; }
+                throw new InvalidOperationException("LLM 未返回完整有效的属性译文，原属性保持不变，点击重试可继续。");
             }
         }
 
@@ -249,7 +258,8 @@ namespace MailPulse.Services
                     await Task.WhenAll(pending.Select(index => RunOneAsync(index, seconds, token, run, failures,
                         throttle, translate))).ConfigureAwait(false);
                 }
-                catch { /* per-unit causes are already recorded in `failures`. */ }
+                catch (OperationCanceledException) when (run.IsCancellationRequested)
+                { /* Per-unit causes are recorded; caller distinguishes failure from user cancellation. */ }
             }
         }
 
@@ -257,15 +267,17 @@ namespace MailPulse.Services
             CancellationTokenSource run, ConcurrentQueue<KeyValuePair<int, Exception>> failures,
             SemaphoreSlim throttle, Func<int, CancellationToken, Task> translate)
         {
-            await throttle.WaitAsync(token).ConfigureAwait(false);
+            try { await throttle.WaitAsync(run.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (run.IsCancellationRequested) { return; }
             try
             {
                 var elapsed = Stopwatch.StartNew();
-                using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(token))
+                using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(run.Token))
                 {
                     timeout.CancelAfter(TimeSpan.FromSeconds(seconds));
                     try
                     {
+                        timeout.Token.ThrowIfCancellationRequested();
                         await translate(index, timeout.Token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (!token.IsCancellationRequested &&
@@ -273,9 +285,9 @@ namespace MailPulse.Services
                     {
                         Logger.Warn("mail translation unit " + (index + 1) +
                             " interrupted; elapsedMs=" + elapsed.ElapsedMilliseconds + "; localTimeout=True");
-                        run.Cancel();
                         RecordFailure(failures, index, new TimeoutException(
                             "第 " + (index + 1) + " 段翻译等待超过 " + seconds + " 秒"));
+                        run.Cancel();
                     }
                     catch (OperationCanceledException) when (token.IsCancellationRequested ||
                         run.Token.IsCancellationRequested)
@@ -287,18 +299,17 @@ namespace MailPulse.Services
                         Logger.Warn("mail translation unit " + (index + 1) +
                             " failed; elapsedMs=" + elapsed.ElapsedMilliseconds +
                             "; error=" + ex.GetType().Name + ": " + ex.Message);
-                        run.Cancel();
                         RecordFailure(failures, index, ex);
+                        run.Cancel();
                     }
                 }
             }
             finally { throttle.Release(); }
         }
 
-        private static void RaiseFailureIfAny(ConcurrentQueue<KeyValuePair<int, Exception>> failures, int total, int seconds)
+        private static void RaiseFailureIfAny(ConcurrentQueue<KeyValuePair<int, Exception>> failures, int total, int completed)
         {
             if (failures.IsEmpty) return;
-            int completed = total - failures.Select(f => f.Key).Distinct().Count();
             var first = failures.First();
             Logger.Warn("mail translation stopped at units " +
                 string.Join(",", failures.Select(f => (f.Key + 1) + "/" + total)) +

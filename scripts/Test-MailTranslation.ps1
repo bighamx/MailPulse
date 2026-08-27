@@ -18,6 +18,7 @@ $compiler = New-Object System.CodeDom.Compiler.CompilerParameters
 $compiler.ReferencedAssemblies.AddRange([string[]]$references)
 Add-Type -CompilerParameters $compiler -TypeDefinition @'
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -47,7 +48,7 @@ public static class MailTranslationSmokeTests
         public int Calls;
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
         {
-            Calls++;
+            Interlocked.Increment(ref Calls);
             return Handle(request, token);
         }
     }
@@ -533,6 +534,55 @@ public static class MailTranslationSmokeTests
                 "larger configured timeout respected per segment");
             cfg.TimeoutSeconds = 8;
 
+            // The first failure cancels in-flight siblings and queued work. Counts must come
+            // from retained results, not total-minus-errors (cancelled units are not completed).
+            {
+                var stopped = translator.CreateSession("S", longBody, cfg);
+                var threeStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                int started = 0, cancelled = 0;
+                stub.Handle = async (req, ct) => {
+                    int call = Interlocked.Increment(ref started);
+                    if (call == 3) threeStarted.TrySetResult(true);
+                    if (call == 1)
+                    {
+                        await threeStarted.Task;
+                        return new HttpResponseMessage(HttpStatusCode.BadRequest);
+                    }
+                    try { await Task.Delay(Timeout.Infinite, ct); }
+                    catch (OperationCanceledException) { Interlocked.Increment(ref cancelled); throw; }
+                    return Reply("{}");
+                };
+                var stoppedTask = translator.TranslateAsync(stopped, CancellationToken.None);
+                Check(Task.WhenAny(stoppedTask, Task.Delay(2500)).GetAwaiter().GetResult() == stoppedTask,
+                    "first failure promptly stops in-flight and queued translation work");
+                string error = "";
+                try { stoppedTask.GetAwaiter().GetResult(); } catch (InvalidOperationException ex) { error = ex.Message; }
+                Check(started == 3 && cancelled == 2, "failure cancels both siblings without starting queued requests");
+                Check(stopped.CompletedParts == 0 && error.Contains("已完成 0 段"), "failure report counts only actual retained results");
+                before = stub.Calls;
+                stub.Handle = async (req, ct) => {
+                    var payload = JObject.Parse(await req.Content.ReadAsStringAsync());
+                    return Reply(Envelope(cfg.Protocol, (string)payload["messages"][1]["content"]));
+                };
+                translator.TranslateAsync(stopped, CancellationToken.None).GetAwaiter().GetResult();
+                Check(stub.Calls - before == stopped.TotalParts && stopped.CompletedParts == stopped.TotalParts,
+                    "retry includes failed, sibling-cancelled and never-started segments");
+            }
+            {
+                var failures = new ConcurrentQueue<KeyValuePair<int, Exception>>();
+                int started = 0;
+                Func<int, CancellationToken, Task> hang = async (index, ct) => {
+                    Interlocked.Increment(ref started);
+                    await Task.Delay(Timeout.Infinite, ct);
+                };
+                var parallel = typeof(MailTranslationService).GetMethod("RunParallelAsync", BindingFlags.Static | BindingFlags.NonPublic);
+                var task = (Task)parallel.Invoke(null, new object[] { Enumerable.Range(0, 8), 1, CancellationToken.None, failures, hang });
+                Check(Task.WhenAny(task, Task.Delay(3000)).GetAwaiter().GetResult() == task,
+                    "per-unit timeout also cancels queued and sibling requests");
+                task.GetAwaiter().GetResult();
+                Check(started == 3 && failures.Any(f => f.Value is TimeoutException), "timeout preserves the initiating failure without starting another batch");
+            }
+
             // HTML in-place weaving with opaque inline placeholders: leaf blocks become units whose
             // template keeps full sentence context; markup/images/links survive.
             string wovenHtml = "<html><body><div class=\"box\" style=\"color:red\"><p>Hello <b>world</b></p>" +
@@ -651,6 +701,66 @@ public static class MailTranslationSmokeTests
                 footnoteLayout.Texts[0].Contains("170 markets") && footnoteLayout.Texts[0].Contains("Second footnote"),
                 "footnote paragraph with br/sup/link stays one unit with all its text");
 
+            // Mixed-content containers and bare HTML fragments must not lose text outside leaf blocks.
+            foreach (string sample in new[] {
+                "<div>BEFORE <b>BOLD</b><p>MIDDLE <a href='https://example.com'>LINK</a></p>AFTER</div>",
+                "<table><tr><td>BEFORE<div>MIDDLE</div>AFTER</td></tr></table>",
+                "BEFORE<br>MIDDLE<a>LINK</a>AFTER" })
+            {
+                var layout = HtmlMailLayout.Parse(sample);
+                string all = string.Join("|", layout.Texts);
+                Check(all.Contains("BEFORE") && all.Contains("MIDDLE") && all.Contains("AFTER"), "collect all mixed-container/root text runs");
+                stub.Handle = (req, ct) => {
+                    var payload = JObject.Parse(ReadString(req.Content));
+                    var input = JObject.Parse((string)payload["messages"][1]["content"]);
+                    return Task.FromResult(Reply(Envelope(cfg.Protocol, Obj("subject", "", "body",
+                        ((string)input["body"]).Replace("BEFORE", "前文").Replace("MIDDLE", "中间").Replace("AFTER", "后文")).ToString())));
+                };
+                string output = translator.TranslateHtmlAsync(layout, "", cfg, CancellationToken.None).GetAwaiter().GetResult();
+                Check(output.Contains("前文") && output.Contains("中间") && output.Contains("后文") &&
+                    !output.Contains("BEFORE") && !output.Contains("AFTER"), "mixed HTML runs are translated in original positions");
+            }
+            var protectedLayout = HtmlMailLayout.Parse("<div>VISIBLE<p>ALSO_VISIBLE</p><script>SECRET_SCRIPT</script><span translate='no'>KEEP_ORIGINAL</span>AFTER</div>");
+            Check(!string.Join("|", protectedLayout.Texts).Contains("SECRET_SCRIPT") &&
+                !string.Join("|", protectedLayout.Texts).Contains("KEEP_ORIGINAL"), "mixed HTML collection respects skipped subtrees");
+
+            // Attribute errors never mark the job complete; success is committed atomically.
+            foreach (string failure in new[] { "http", "cancel", "{}", "{\"attributes\":[]}",
+                "{\"attributes\":[{\"id\":0,\"text\":\"x\"},{\"id\":0,\"text\":\"y\"}]}",
+                "{\"attributes\":[{\"id\":0,\"text\":\"x\"},{\"id\":1,\"text\":\"\"}]}" })
+            {
+                var layout = HtmlMailLayout.Parse("<p>BODY</p><img alt=\"ALT\" title=\"TITLE\">");
+                stub.Handle = (req, ct) => {
+                    var payload = JObject.Parse(ReadString(req.Content));
+                    var input = JObject.Parse((string)payload["messages"][1]["content"]);
+                    if (input["attributes"] == null) return Task.FromResult(Reply(Envelope(cfg.Protocol, input.ToString())));
+                    if (failure == "http") return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
+                    if (failure == "cancel") { var cancelled = new TaskCompletionSource<HttpResponseMessage>(); cancelled.SetCanceled(); return cancelled.Task; }
+                    return Task.FromResult(Reply(Envelope(cfg.Protocol, failure)));
+                };
+                bool failed = false;
+                try { translator.TranslateHtmlAsync(layout, "", cfg, CancellationToken.None).GetAwaiter().GetResult(); }
+                catch (Exception ex) { failed = ex is InvalidOperationException || ex is HttpRequestException; }
+                Check(failed && !Get<bool>(layout, "AttributesDone") && layout.CompletedJobs == 1,
+                    "failed/malformed attribute response remains unfinished: " + failure);
+                var attrs = Get<System.Collections.IList>(layout, "Attributes");
+                Check(attrs.Cast<object>().All(a => Get<string>(a, "Translated") == null), "invalid attribute batch commits no partial values");
+                before = stub.Calls;
+                stub.Handle = (req, ct) => Task.FromResult(Reply(Envelope(cfg.Protocol,
+                    "{\"attributes\":[{\"id\":1,\"text\":\"标题\"},{\"id\":0,\"text\":\"图片\"}]}")));
+                string output = translator.TranslateHtmlAsync(layout, "", cfg, CancellationToken.None).GetAwaiter().GetResult();
+                Check(stub.Calls - before == 1 && layout.CompletedJobs == 2 && output.Contains("alt=\"图片\"") && output.Contains("title=\"标题\""),
+                    "retry sends only unfinished attributes and accepts reordered valid IDs");
+            }
+            {
+                var layout = HtmlMailLayout.Parse("<img alt='ALT'>");
+                Check(layout.TotalUnits == 0 && layout.TotalJobs == 1, "attribute-only mail has a retryable translation job");
+                stub.Handle = async (req, ct) => { await Task.Delay(Timeout.Infinite, ct); return Reply("{}"); };
+                using (var stop = new CancellationTokenSource(50))
+                    Throws<OperationCanceledException>(() => translator.TranslateHtmlAsync(layout, "", cfg, stop.Token), "user cancellation propagates through attribute job");
+                Check(!Get<bool>(layout, "AttributesDone") && layout.CompletedJobs == 0, "cancelled attributes are not marked complete");
+            }
+
             var config = new ConfigService(); // Deliberately do not Load() or Save() real configuration.
             config.Current.Llms.Add(cfg);
             config.Current.LlmFallbackEnabled = false;
@@ -687,6 +797,78 @@ public static class MailTranslationSmokeTests
                 Invoke(window, "ShowTranslation", true);
                 Check(Get<WebBrowser>(window, "_htmlBody").Visibility == Visibility.Visible,
                     "partial translation view also prefers the woven web document for html mail");
+
+                // Exercise the actual UI patch loop with a controlled DOM sink. Requests complete
+                // C -> attributes -> A -> B; neither a count nor an attribute job is a text index.
+                Invoke(window, "ResetTranslation");
+                var orderedLayout = HtmlMailLayout.Parse("<p>A</p><p>B</p><p>C</p><img alt='ALT'>");
+                Set(window, "_htmlLayout", orderedLayout);
+                var replies = new ConcurrentDictionary<string, TaskCompletionSource<HttpResponseMessage>>();
+                foreach (string key in new[] { "A", "B", "C", "attributes" })
+                    replies[key] = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+                stub.Handle = (req, ct) => {
+                    var payload = JObject.Parse(ReadString(req.Content));
+                    var input = JObject.Parse((string)payload["messages"][1]["content"]);
+                    return replies[input["attributes"] != null ? "attributes" : (string)input["body"]].Task;
+                };
+                var orderedTask = translator.TranslateHtmlAsync(orderedLayout, "", cfg, CancellationToken.None);
+                var domText = new Dictionary<int, string>();
+                var domAttrs = new Dictionary<int, string>();
+                int patchCalls = 0;
+                Func<int, int, string, bool> patchText = (i, k, text) => { domText[i] = text; patchCalls++; return true; };
+                Func<int, string, string, bool> patchAttribute = (i, name, text) => { domAttrs[i] = text; return true; };
+                replies["C"].SetResult(Reply(Envelope(cfg.Protocol, Obj("subject", "", "body", "C译文").ToString())));
+                Pump(Task.Run(() => { if (!SpinWait.SpinUntil(() => orderedLayout.CompletedUnits == 1, 2000)) throw new Exception("C did not finish"); }));
+                Invoke(window, "ApplyHtmlUnitDeltas", (Func<int, int, string, bool>)((i, k, text) => false), patchAttribute);
+                Check(Get<HashSet<int>>(window, "_htmlAppliedUnits").Count == 0, "missing/loading DOM nodes are not marked applied");
+                Invoke(window, "ApplyHtmlUnitDeltas", patchText, patchAttribute);
+                Invoke(window, "ApplyHtmlUnitDeltas", patchText, patchAttribute);
+                Check(domText.Count == 1 && domText[2] == "C译文" && patchCalls == 1,
+                    "out-of-order unit is patched by ID once, not by completion count");
+                replies["attributes"].SetResult(Reply(Envelope(cfg.Protocol, "{\"attributes\":[{\"id\":0,\"text\":\"图片\"}]}")));
+                Pump(Task.Run(() => { if (!SpinWait.SpinUntil(() => orderedLayout.CompletedJobs == 2, 2000)) throw new Exception("Attributes did not finish"); }));
+                Invoke(window, "ApplyHtmlUnitDeltas", patchText, patchAttribute);
+                Check(domAttrs[0] == "图片" && domText.Count == 1 && patchCalls == 1,
+                    "late attributes patch independently without advancing a text index");
+                replies["A"].SetResult(Reply(Envelope(cfg.Protocol, Obj("subject", "", "body", "A译文").ToString())));
+                Pump(Task.Run(() => { if (!SpinWait.SpinUntil(() => orderedLayout.CompletedUnits == 2, 2000)) throw new Exception("A did not finish"); }));
+                Invoke(window, "ApplyHtmlUnitDeltas", patchText, patchAttribute);
+                Check(domText.Count == 2 && domText[0] == "A译文" && !domText.ContainsKey(1), "late first unit is never skipped");
+                replies["B"].SetResult(Reply(Envelope(cfg.Protocol, Obj("subject", "", "body", "B译文").ToString())));
+                Pump(orderedTask);
+                Invoke(window, "ApplyHtmlUnitDeltas", patchText, patchAttribute);
+                Check(domText.Count == 3 && domText[1] == "B译文" && patchCalls == 3,
+                    "final UI delta applies every text unit regardless of completion order");
+                string snapshot = (string)orderedLayout.GetType().GetMethod("Build", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(orderedLayout, null);
+                Invoke(window, "RenderHtmlTranslation", snapshot, orderedLayout.CompletedJobs, orderedLayout.TotalJobs);
+                Check(Get<HashSet<int>>(window, "_htmlAppliedUnits").Count == 0 &&
+                    Get<HashSet<int>>(window, "_htmlAppliedAttributes").Count == 0, "navigation resets applied IDs rather than guessing from snapshot count");
+                Invoke(window, "ApplyHtmlUnitDeltas", patchText, patchAttribute);
+                Check(patchCalls == 6, "completed units can all be replayed after document navigation");
+
+                // Verify the injected patch functions against the real WPF/IE document too.
+                // This hidden host contains only local synthetic markup; no external resources.
+                var browser = new WebBrowser();
+                var browserHost = new Window { Content = browser, Width = 300, Height = 150,
+                    Opacity = 0, ShowInTaskbar = false, ShowActivated = false };
+                try
+                {
+                    var loaded = new TaskCompletionSource<bool>();
+                    browser.LoadCompleted += (s, e) => loaded.TrySetResult(true);
+                    browserHost.Show();
+                    var buildDocument = typeof(MailCenterWindow).GetMethod("BuildHtmlDocument", BindingFlags.Static | BindingFlags.NonPublic);
+                    string document = (string)buildDocument.Invoke(null, new object[] {
+                        "<p><span id='textTarget' data-mp='2' data-frag='0'>Original</span></p><img id='attributeTarget' data-mp-attr-0='' alt='Original'>" });
+                    browser.NavigateToString(document);
+                    Pump(loaded.Task);
+                    Check(Equals(browser.InvokeScript("mpApply", new object[] { 2, 0, "正文译文" }), true), "real browser reports successful text patch");
+                    Check(Equals(browser.InvokeScript("mpApply", new object[] { 99, 0, "missing" }), false), "real browser reports missing patch target");
+                    Check(Equals(browser.InvokeScript("mpApplyAttribute", new object[] { 0, "alt", "图片译文" }), true), "real browser applies attribute patch");
+                    Check((string)browser.InvokeScript("eval", new object[] { "document.getElementById('textTarget').textContent" }) == "正文译文" &&
+                        (string)browser.InvokeScript("eval", new object[] { "document.getElementById('attributeTarget').getAttribute('alt')" }) == "图片译文",
+                        "real browser DOM contains both text and attribute translations");
+                }
+                finally { browserHost.Close(); browser.Dispose(); }
 
                 Invoke(window, "ClearPreview");
                 Check(Get<MailTranslationSession>(window, "_translationSession") == null, "switching mail clears partial translation session");

@@ -19,7 +19,7 @@ MailPulse 是一个 **Windows 托盘常驻的邮件验证码监控工具**：
 ## 2. 仓库与发布
 
 - GitHub（公开）：https://github.com/bighamx/MailPulse
-- 发布版本：v0.3.0（含单文件 exe + exe.config，另提供 ZIP 压缩包）
+- 发布版本：v0.3.1（仅发布 ZIP 附件，内含 exe、exe.config、许可证及发布说明）
 - 提交作者使用 GitHub 匿名邮箱（`bighamx@users.noreply.github.com`），**避免泄漏个人邮箱**
 - **红线**：本仓库公开，任何提交不得包含真实账号、密码、API Key、`%AppData%` 下的配置/日志/seen.json
 
@@ -116,9 +116,10 @@ MailPulse/
 - 正文加载后点击“翻译为中文”，复用第一个启用且模型/API Key 有效的 LLM 配置；不依赖验证码的 `LlmFallbackEnabled` 开关
 - `LlmClient` 共享三协议请求；分类保留原提示词和超时。纯文本邮件按约 1800 字符分段，优先段落/句子边界并保护 URL、邮箱地址、标识符和 UTF-16 代理对；每段独立等待至少 120 秒（若配置更长则沿用），最大输出 8192 tokens。主题只在首段翻译
 - **HTML 邮件原地织入排版（XLIFF 风格不透明占位符）**：`HtmlMailLayout`（HtmlAgilityPack）把正文解析成**块级翻译单元**——每个不含块级子元素的元素（`p`/`div`/`li`/`td`/`h1-h6`/`pre` 等）整体一个单元；块内每个内联元素（`<b>`/`<a>`/`<sup>`/`<img>`/`<br>` 等）变为不透明占位符 `⟦N⟧...⟦/N⟧`，整块作为一个带占位符的**模板字符串**发给 LLM（`body` 字段）。模型看到完整句子上下文，必须原样保留每个占位符（开/闭、顺序、嵌套）。回填时解析模板树并校验：占位符缺失/重复/乱序/嵌套非法 → 整段降级（去标记并入首片段），绝不写坏结构。图片/链接/表格/内联样式不丢，单元数≈段落数，首段在第一批并行请求中即完成
-- **属性翻译**：`alt`/`title`/`placeholder`/`aria-label`/`aria-description` 作为批量属性单元，一次请求发送 `attributes:[{id,text}]` 数组并等长回填（`AttributeSystemPrompt`）；`translate="no"`/`data-no-translate` 子树跳过。响应畸形时不致命、保留原值
+- **属性翻译**：`alt`/`title`/`placeholder`/`aria-label`/`aria-description` 作为批量属性单元，一次请求发送 `attributes:[{id,text}]` 数组（`AttributeSystemPrompt`）；校验数量、ID 唯一性和非空译文后整批回填。HTTP 错误、超时、取消及畸形响应均保留原值且保持未完成，重试只补译未完成任务；`translate="no"`/`data-no-translate` 子树跳过
 - **排除与净化**：`<head>/<style>/<script>/<title>/<meta>/<link>/<code>/<pre>/<svg>` 整棵子树不翻译；空白/纯标点块（如 `<p>&nbsp;</p>`）不发送。`HtmlAgilityPack` 不解码命名实体，故先 `HtmlDecode` 再折叠空白，避免字面 `&nbsp;` 被送去 LLM 又回显成正文。`<br>/<hr>` 是内联换行、不视为块容器，含 `<br>` 的脚注/页脚段落必须整段成单元（否则 sup/a 各自成段而正文文本被孤立）
 - **阅读体验**：首次完成才导航一次到织入文档，之后各段完成通过注入的 `mpApply` 脚本就地替换 `data-mp/data-frag` 标记片段的文本，不重载页面，读者滚动位置不被打断；纯文本邮件逐段合并时也保留 `ScrollViewer` 偏移
+- **HTML 完整性和乱序回填**：按块边界划分连续文字/行内元素，不遗漏 `<div>前文<p>中间</p>后文</div>` 的前后文字，也支持无外层标签的片段；不移动原节点或改变块布局。文本和属性分别按成功应用的 ID 集合去重，不把完成数量当连续下标。页面尚未加载或节点未找到时不记为已应用；导航后可幂等重放，晚到的属性通过 `mpApplyAttribute` 更新
 - 只发送主题和已提取的文本正文，不发送 HTML 源码、附件、图片；邮件内容明确作为待翻译数据，不执行其中的指令
 - 译文作为纯文本（无 HTML 时）或织入原文版式的网页（有 HTML 时）显示，可切换回原文；不覆盖原邮件，不修改回复引用、验证码测试或服务器内容
 - `MailTranslationSession` 在内存中保留已完成的段落，失败/取消后重试只请求未完成部分；更改模型、地址或 Key 时重新建立会话，提高超时时间不清除已完成部分。切换邮件/刷新后清除，不持久化邮件内容
@@ -127,6 +128,7 @@ MailPulse/
 - 本地超时与上游/网络取消分开提示；诊断日志只记录段号、字符数、耗时，不记录邮件内容、Key 或服务响应
 - 卡在 `stage=sending` 的含义：`headers` 日志只有在 `SendAsync` 返回后才写入，因此长时间停留在 `sending` 表示请求处于排队/建连/TLS/已发送 body/等待响应头中的某一步，不能证明请求未到达网关。net48 的 ServicePointManager 默认每主机仅 2 个连接（按 scheme+host+port 键控的 ServicePoint 共享，不按 handler 隔离），慢速或已被取消的分类请求与翻译并发时可能占满槽位；而空闲长连接被网关半关闭后复用、`Expect: 100-continue` 中间握手不被中间设备应答，都表现为无并发的单请求停滞。当前实现已按上述机制规避：每调用独立连接组、`ConnectionClose=true`、`ExpectContinue=false`。若仍需定位差异，用日志中的 requestId 与网关侧请求日志对照即可确认瓶颈在本端还是上游
 - **并行分段**：`RunParallelAsync` 是纯文本与 HTML 织入共用的并发管线——最多 3 路在途请求、每段独立 `CancelAfter` 超时、某段失败即取消其余在途请求避免在坏配置下浪费额度；已完成段保留在会话里可续传。`Progress<T>`/`HtmlTranslationProgress` 每次都携带合并快照（译文替换、未完成段保留原文），UI 首段完成即切入译文视图并随进度刷新
+- **失败/取消回归**：排队和在途任务都链接本轮 `run.Token`，首个失败后不再启动新批次；失败提示使用实际缓存的完成数量，不使用“总数减报错数”。测试覆盖 C→属性→A→B 乱序回填、DOM 未就绪重试、真实 WPF 浏览器脚本、嵌套/裸 HTML、首错停止、超时取消、属性失败及续传；全部使用虚构邮件与模拟接口
 
 ### 4.9 微软邮箱：推荐接入方式与踩坑记录
 
@@ -184,8 +186,9 @@ dotnet build MailPulse.csproj -c Release
 # 产物：bin\Release\net48\MailPulse.exe（+ exe.config，必需同目录）
 
 # 发布新版本
-git tag v0.3.0 && git push origin v0.3.0
-gh release create v0.3.0 "bin\Release\net48\MailPulse.exe" "bin\Release\net48\MailPulse.exe.config" --title "v0.3.0" --notes "..."
+git tag v0.3.1 && git push origin v0.3.1
+# 从该提交构建并验证后，将 exe、exe.config、LICENSE、发布说明及校验值打成 ZIP
+gh release create v0.3.1 "publish\v0.3.1\MailPulse-v0.3.1-win.zip" --verify-tag --title "v0.3.1" --notes-file "docs\releases\v0.3.1.md"
 ```
 
 > 系统需 .NET SDK（含 net48 开发包）；Win10/11 自带 .NET Framework 4.8 运行时。
