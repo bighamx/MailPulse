@@ -136,4 +136,4 @@ dotnet build MailPulse.csproj -c Release
 
 ## 📄 License
 
-[MIT](LICENSE)
+本项目采用 [Selective Freedom License (SFL) v1.0](https://github.com/bighamx/MIT-NoHuawei) 授权，详见 [LICENSE](LICENSE)。
