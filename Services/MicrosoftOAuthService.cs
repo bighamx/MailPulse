@@ -9,10 +9,13 @@ namespace MailPulse.Services
 {
     /// <summary>
     /// Microsoft OAuth2 device-code flow for consumer accounts (live.cn / live.com / outlook.com).
-    /// Supports the legacy read-only public client and a user-supplied Entra public client.
+    /// Supports the shared MailPulse public client, custom Entra apps and legacy read-only login.
     /// </summary>
     public static class MicrosoftOAuthService
     {
+        // Public application identifier, intentionally distributed with MailPulse (not a secret).
+        public const string DefaultClientId = "7c03e9d6-9a11-418a-afaa-c959a3154bdd";
+
         // Legacy Microsoft public desktop client used by the original MailPulse read-only flow.
         private const string LegacyClientId = "d3590ed6-52b3-4102-aeff-aad2292ab01c";
         private const string Tenant = "consumers";   // personal Microsoft accounts only

@@ -26,6 +26,8 @@ namespace MailPulse.Services
         // pending "mark as read" requests (accountId -> uid)
         private readonly ConcurrentQueue<Tuple<string, UniqueId>> _pendingMarkRead =
             new ConcurrentQueue<Tuple<string, UniqueId>>();
+        private readonly ConcurrentDictionary<Task, byte> _messageTasks =
+            new ConcurrentDictionary<Task, byte>();
 
         private CancellationTokenSource _cts;
         public event Action<Models.ClassifyResult> OnNewMatchedMail;
@@ -69,10 +71,21 @@ namespace MailPulse.Services
                 }
                 if (token.IsCancellationRequested) break;
                 int delaySeconds = consecutiveFailures == 0
-                    ? 10
+                    ? GetSuccessfulLoopDelaySeconds(acc)
                     : Math.Min(300, 15 * (1 << Math.Min(4, consecutiveFailures)));
                 try { await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token); } catch (OperationCanceledException) { break; }
             }
+        }
+
+        internal static int GetSuccessfulLoopDelaySeconds(Models.AccountConfig account)
+        {
+            // IMAP IDLE stays inside ImapIdleAsync until disconnect/cancellation, so this is only
+            // a short reconnect delay. Graph has no desktop push channel: a small poll interval is
+            // the fastest reliable option without operating a public webhook service.
+            if (MailCenterService.IsGraphAccount(account)) return 5;
+            if (account != null && account.Protocol == Models.MailProtocol.Pop3)
+                return Math.Max(15, account.PollIntervalSeconds);
+            return 2;
         }
 
         private async Task ImapIdleAsync(Models.AccountConfig acc, CancellationToken token)
@@ -101,11 +114,19 @@ namespace MailPulse.Services
                     while (!token.IsCancellationRequested && client.IsConnected)
                     {
                         using (var done = new CancellationTokenSource(TimeSpan.FromMinutes(25)))
-                        using (var linked = CancellationTokenSource.CreateLinkedTokenSource(token, done.Token))
                         {
-                            try { await client.IdleAsync(linked.Token); }
+                            // MailKit raises folder events while IdleAsync is still running; the
+                            // method does not return just because EXISTS/EXPUNGE arrived. Cancel the
+                            // current IDLE command from the event, then perform server operations.
+                            EventHandler<EventArgs> countChanged = (s, e) =>
+                            {
+                                try { done.Cancel(); } catch (ObjectDisposedException) { }
+                            };
+                            inbox.CountChanged += countChanged;
+                            try { await client.IdleAsync(done.Token, token); }
                             catch (OperationCanceledException) { if (token.IsCancellationRequested) throw; }
-                            if (inbox.Count > 0)
+                            finally { inbox.CountChanged -= countChanged; }
+                            if (client.IsConnected && inbox.Count > 0)
                             {
                                 await CheckUnseenAsync(acc, inbox, token);
                                 await DrainMarkReadAsync(acc, inbox, token);
@@ -142,7 +163,7 @@ namespace MailPulse.Services
 
                 string key = acc.Id + "|" + (string.IsNullOrEmpty(msg.MessageId) ? uid.ToString() : msg.MessageId);
                 if (_seen.Contains(key)) continue;   // already alerted in a previous run
-                await ProcessMessageAsync(acc, msg, key, () =>
+                QueueMessageProcessing(acc, msg, key, () =>
                 {
                     // user clicked copy/ignore -> mark as read on the live IMAP session
                     _pendingMarkRead.Enqueue(Tuple.Create(acc.Id, uid));
@@ -188,7 +209,8 @@ namespace MailPulse.Services
                     }
                 }
                 foreach (var item in pending)
-                    await ProcessMessageAsync(acc, item.Item1, item.Item2, null, CancellationToken.None);   // POP3 has no \Seen flag
+                    QueueMessageProcessing(acc, item.Item1, item.Item2, null,
+                        _cts == null ? CancellationToken.None : _cts.Token); // POP3 has no \Seen flag
             }
         }
 
@@ -213,7 +235,7 @@ namespace MailPulse.Services
                     if (MailboxAddress.TryParse(content.From, out mailbox)) message.From.Add(mailbox);
                     message.Body = new TextPart("plain") { Text = content.Body ?? "" };
                     string messageId = row.Id;
-                    await ProcessMessageAsync(acc, message, key, () => Task.Run(async () =>
+                    QueueMessageProcessing(acc, message, key, () => Task.Run(async () =>
                     {
                         try
                         {
@@ -224,6 +246,23 @@ namespace MailPulse.Services
                     }), token);
                 }
             }
+        }
+
+        private void QueueMessageProcessing(Models.AccountConfig account, MimeMessage message,
+            string seenKey, Action markRead, CancellationToken token)
+        {
+            // Classification may call an LLM and take several seconds. Do not hold IMAP IDLE or
+            // delay the next Graph poll while it runs; UID de-duplication already happened first.
+            Task task = ProcessMessageAsync(account, message, seenKey, markRead, token);
+            _messageTasks.TryAdd(task, 0);
+            task.ContinueWith(completed =>
+            {
+                byte ignored;
+                _messageTasks.TryRemove(completed, out ignored);
+                if (completed.IsFaulted && completed.Exception != null)
+                    Logger.Error("mail classification failed for " + account.Name,
+                        completed.Exception.GetBaseException());
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
 
         private async Task ProcessMessageAsync(Models.AccountConfig acc, MimeMessage msg, string seenKey, Action markRead, CancellationToken token)

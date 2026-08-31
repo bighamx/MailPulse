@@ -2,7 +2,7 @@
 
 托盘常驻的邮件验证码监控工具 —— 收到验证码 / 确认链接邮件时即时弹出悬浮通知，一键复制验证码、打开链接；内置轻量邮件中心，可查看、回复和发送邮件。
 
-微软邮箱推荐使用自有 Entra 公共客户端应用 + Microsoft Graph，可统一完成读取、监控、标为已读、删除和发送。程序只保存 DPAPI 加密的 refresh token，不需要也不会保存客户端密钥。旧版微软第一方“快速登录”曾可正常读取，且已有 refresh token 可能继续有效；但当前重新授权可能因预授权策略返回 `invalid_request`，因此不再建议作为唯一方案。
+微软邮箱默认使用 MailPulse 内置的 Entra 公共客户端应用 + Microsoft Graph，无需自行注册应用，可统一完成读取、监控、标为已读、删除和发送；也可选择自定义 Entra。Graph 约每 5 秒检查一次；支持 IMAP IDLE 的普通邮箱由服务器新邮件事件即时唤醒。程序只保存 DPAPI 加密的 refresh token，不需要也不会保存客户端密钥。旧版微软第一方“快速登录”仅保留兼容入口，重新授权可能返回 `invalid_request`。
 
 基于 **.NET Framework 4.8**（WPF + WinForms 托盘），Windows 10/11 开箱即用。
 
@@ -92,16 +92,17 @@ dotnet build MailPulse.csproj -c Release
 | -------------- | ---- | ------------------------------------------------------- |
 | Gmail          | IMAP | 需开启两步验证并生成**应用专用密码**                    |
 | QQ 邮箱        | IMAP | 网页端开启 IMAP 并生成**授权码**（非 QQ 密码）          |
-| Outlook / Live | Microsoft Graph | 使用自有 Entra 公共客户端，添加 `Mail.ReadWrite`、`Mail.Send` 委托权限后完成 OAuth 授权 |
+| Outlook / Live | Microsoft Graph | 选择默认微软登录，用自己的邮箱完成 OAuth 授权，无需注册 Entra |
 
 ### Outlook / Live 快速配置
 
-1. 在 Microsoft Entra 管理中心注册应用，帐户类型选择包含“个人 Microsoft 帐户”的选项
-2. 进入“身份验证”→“高级设置”，将 **允许公共客户端流**设为“是”
-3. 进入“API 权限”→ Microsoft Graph →“委托的权限”，添加 `Mail.ReadWrite` 和 `Mail.Send`
-4. MailPulse 中编辑 Outlook 账号，选择“自有 Entra + Microsoft Graph（读取和发送）”
-5. 填写“应用程序（客户端）ID”，点击 OAuth 登录，前往设备登录页面输入代码
-6. 保存后点击“测试连接”；邮件中心的读取、正文、已读、删除、回复和发送都会自动走 Graph
+1. MailPulse 中添加 Outlook 账号，保持“默认微软登录（读取和发送）”
+2. 点击“微软 OAuth 登录”，前往设备登录页面输入代码，使用自己的微软个人邮箱登录并同意授权
+3. 保存后点击“测试连接”；邮件中心的读取、正文、已读、删除、回复和发送都会自动走 Graph
+
+默认应用客户端 ID 为 `7c03e9d6-9a11-418a-afaa-c959a3154bdd`，它是可公开分发的应用标识，不是密钥。各用户独立登录，令牌在各自电脑加密保存。当前仅支持微软个人账号，不包含企业 Microsoft 365 账号。
+
+如需使用自己的应用，选择“自定义 Entra（读取和发送）”：注册支持个人 Microsoft 帐户的应用，启用“允许公共客户端流”，添加 Microsoft Graph 委托权限 `Mail.ReadWrite` 和 `Mail.Send`，填写客户端 ID 并登录。切换应用须重新授权；仅切换选项或保存不会替换已有令牌的客户端 ID。
 
 > 设备码流程本身仍然可用。旧版本借用的微软 Office 第一方客户端 ID 在历史版本以及本轮排障早期曾正常工作，但当前对同一账号重新发起最小 IMAP 权限授权时，会因未预授权返回 `invalid_request`。这不代表微软已全局永久关闭该方案，只说明新授权的可用性不可控；已有 refresh token 与新 consent 的结果也可能不同。使用自己注册并启用公共客户端流的 Entra 应用可稳定完成设备码登录。
 

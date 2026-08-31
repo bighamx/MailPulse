@@ -65,7 +65,7 @@ MailPulse/
 - 主题：`config.json` 的 `ThemeMode`（"Light"/"Dark"），启动时 `Theme.Apply()`
 
 ### 4.2 邮件监控（MailMonitorService）
-- 每个启用账号独立 `Task` 循环；Graph 账号轮询最近未读邮件；IMAP 走 `ImapClient` + `IdleAsync`（25 分钟心跳）；POP3 轮询最后 10 封
+- 每个启用账号独立 `Task` 循环；Graph 账号约每 5 秒轮询最近邮件；IMAP 走 `ImapClient` + `IdleAsync`（25 分钟心跳），`CountChanged` 事件会取消当前 IDLE 并立即扫描，不能等待 `IdleAsync` 自行返回；POP3 按账号间隔轮询最后 10 封。正文抓取完成后，规则/LLM 分类进入可取消的后台任务，不阻塞重新进入 IDLE 或下一次 Graph 检查；UID 已先去重，后台异常由 continuation 观察并记录
 - 连续失败使用指数退避（最高 5 分钟），避免短间隔认证轰击触发服务端保护；异常记录日志
 - **去重**：会话内 UID 集合（避免重复抓取）+ `SeenStore` 持久化（`accountId|MessageId`），只记录「真正提醒过」的邮件
 - **标记已读**：Toast 点击后把 `(accountId, UniqueId)` 入队，下次 IDLE 唤醒时 `AddFlags(Seen)`；POP3 无此概念
@@ -132,18 +132,22 @@ MailPulse/
 
 ### 4.9 微软邮箱：推荐接入方式与踩坑记录
 
-#### 推荐方案：自有 Entra 公共客户端 + Microsoft Graph
+#### 推荐方案：默认 / 自定义 Entra 公共客户端 + Microsoft Graph
 
 当前唯一经过完整实测的微软个人邮箱方案是 Microsoft Graph。它覆盖读取列表、正文、已读、删除、后台监控和发送，不依赖 Exchange IMAP/SMTP OAuth。
 
-Entra 应用配置：
+普通用户选择“默认微软登录（读取和发送）”，无需注册 Entra。`MicrosoftOAuthService.DefaultClientId` 为维护者授权公开分发的 `7c03e9d6-9a11-418a-afaa-c959a3154bdd`；它不是密钥，不分发任何用户令牌。默认模式隐藏客户端 ID 输入和注册说明。
+
+自定义 Entra 应用配置：
 
 1. 在 Microsoft Entra 管理中心注册应用；支持的帐户类型必须包含“个人 Microsoft 帐户”（本项目 OAuth 端点使用 `consumers`）
 2. “身份验证”中启用 **允许公共客户端流 / Allow public client flows**；桌面应用不创建、不保存客户端密钥
 3. “API 权限”→ Microsoft Graph → 委托的权限，添加：
    - `Mail.ReadWrite`：读取正文、监控、标为已读和删除
    - `Mail.Send`：发送和回复
-4. 在账号编辑页选择“自有 Entra + Microsoft Graph（读取和发送）”，填写应用程序（客户端）ID，完成设备码登录
+4. 在账号编辑页选择“自定义 Entra（读取和发送）”，填写应用程序（客户端）ID，完成设备码登录
+
+兼容性：新账号默认使用内置应用；已有相同客户端 ID 的账号显示默认模式，其他自定义应用保持不变，已有旧版 IMAP 授权保留旧版模式。仅在 Graph 登录成功后更新账号的客户端 ID 和 Graph 令牌，不能为旧令牌直接套用新 ID。服务层空 ID 仍表示旧版登录，UI 仅在明确选择旧版模式时传空；自定义 ID 留空或无效必须报错，不能回退到第一方应用。
 
 代码路径：
 
@@ -215,6 +219,7 @@ gh release create v0.3.1 "publish\v0.3.1\MailPulse-v0.3.1-win.zip" --verify-tag 
 6. 邮件翻译回归：构建 Debug 后运行 `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File scripts\Test-MailTranslation.ps1`；使用本地模拟 HTTP 验证三协议、分类兼容性、分段完整性、断点重试、超时预算、异常、取消、原文切换和过期响应，不读取真实配置、不发送真实邮件。可传入 `-PreviewPath <png路径>` 和 `-ThemeMode Light/Dark` 渲染测试界面
 7. 响应读取回归包含不发送 EOF 的模拟流，以及真实本机 TCP 网关：发送完整 JSON chunk 但不发送结尾零块，连续请求三次验证仍能立即完成，并检查无 Expect 握手、Connection 关闭；覆盖 LLM 编辑保留/替换 Key 和缺失 Key 校验。测试日志隔离在构建目录的 `test-logs`，不混入真实应用日志
 8. HTML 织入回归：占位符模板（`⟦N⟧`）映射回填、占位符缺失降级、`alt/title/aria-label` 属性批量翻译、`&nbsp;` 解码与空白块排除、含 `<br>/<sup>/<a>` 的脚注段落整段成单元、真实邮件端到端翻译（`scripts\Translate-HtmlMail.ps1`，用本机 LLM 配置，产物为独立 HTML 文件）
+9. 微软默认登录回归：`powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File scripts\Test-MicrosoftLogin.ps1`；虚构账号验证默认/自定义/旧版选择、无效 ID 拦截、现有令牌和 ID 保留、新授权保存及 Graph 路由，不访问微软、不读取真实配置。
 
 ## 8. 待办 / 路线图
 

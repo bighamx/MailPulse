@@ -12,7 +12,7 @@ namespace MailPulse.UI
         private TextBox _tbName, _tbHost, _tbUser, _tbPass, _tbPort, _tbInterval, _tbSmtpHost, _tbSmtpPort, _tbOAuthClientId;
         private ComboBox _cbProtocol, _cbPreset, _cbOAuthMode;
         private CheckBox _chkSsl, _chkSmtpSsl, _chkEnabled;
-        private TextBlock _oauthLabel, _oauthStatus, _codeText, _oauthClientIdLabel;
+        private TextBlock _oauthLabel, _oauthStatus, _codeText, _oauthClientIdLabel, _oauthModeHint;
         private Button _oauthRegistrationButton;
         private StackPanel _oauthPanel, _codePanel;
         private string _imapRefreshToken, _graphRefreshToken;
@@ -78,19 +78,20 @@ namespace MailPulse.UI
                 Margin = new Thickness(0, 0, 0, 4)
             });
             _cbOAuthMode = new ComboBox { Margin = new Thickness(0, 0, 0, 7) };
-            _cbOAuthMode.Items.Add("快速登录（用于读取，无需注册 Entra）");
-            _cbOAuthMode.Items.Add("自有 Entra + Microsoft Graph（读取和发送）");
-            _cbOAuthMode.SelectedIndex = string.IsNullOrWhiteSpace(_authorizedOAuthClientId) ? 0 : 1;
+            _cbOAuthMode.Items.Add("默认微软登录（读取和发送）");
+            _cbOAuthMode.Items.Add("自定义 Entra（读取和发送）");
+            _cbOAuthMode.Items.Add("旧版快速登录（仅兼容读取）");
+            _cbOAuthMode.SelectedIndex = 0;
             Theme.StyleComboBox(_cbOAuthMode);
             _oauthPanel.Children.Add(_cbOAuthMode);
-            _oauthPanel.Children.Add(new TextBlock
+            _oauthModeHint = new TextBlock
             {
-                Text = "推荐使用自有 Entra + Microsoft Graph，可统一读取、标记、删除和发送邮件。",
                 Foreground = Theme.TextDimB,
                 FontSize = 11.5,
                 TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(0, 0, 0, 7)
-            });
+            };
+            _oauthPanel.Children.Add(_oauthModeHint);
             _oauthClientIdLabel = new TextBlock
             {
                 Text = "Microsoft Entra 应用客户端 ID（不是密钥）",
@@ -112,7 +113,7 @@ namespace MailPulse.UI
                     Theme.SetButtonLoading(oauthBtn, true, "等待授权…");
                     _oauthStatus.Text = "获取设备码...";
                     _codePanel.Visibility = Visibility.Collapsed;
-                    string requestedClientId = _cbOAuthMode.SelectedIndex == 1 ? _tbOAuthClientId.Text.Trim() : "";
+                    string requestedClientId = GetRequestedOAuthClientId();
                     var start = await Services.MicrosoftOAuthService.StartDeviceLoginAsync(requestedClientId);
                     _oauthStatus.Text = "在浏览器打开 microsoft.com/link 输入代码：";
                     _codeText.Text = start.UserCode;
@@ -121,8 +122,8 @@ namespace MailPulse.UI
                     var result = await Services.MicrosoftOAuthService.PollForTokenAsync(start);
                     if (result.Success)
                     {
-                        bool smtpAuthorization = !string.IsNullOrWhiteSpace(requestedClientId);
-                        if (smtpAuthorization)
+                        bool graphAuthorization = !string.IsNullOrWhiteSpace(requestedClientId);
+                        if (graphAuthorization)
                         {
                             _graphRefreshToken = result.RefreshToken;
                             _authorizedOAuthClientId = requestedClientId;
@@ -134,8 +135,8 @@ namespace MailPulse.UI
                             _tbUser.Text = result.UserEmail;
                         if (_editing != null)
                             Services.MicrosoftOAuthService.RememberAccessToken(
-                                _editing.Id, result.AccessToken, result.RefreshToken, result.ExpiresAtUtc, false, smtpAuthorization);
-                        _oauthStatus.Text = smtpAuthorization
+                                _editing.Id, result.AccessToken, result.RefreshToken, result.ExpiresAtUtc, false, graphAuthorization);
+                        _oauthStatus.Text = graphAuthorization
                             ? "✓ Microsoft Graph 读取和发送授权成功" + (string.IsNullOrWhiteSpace(result.UserEmail) ? "" : "：" + result.UserEmail)
                             : "✓ 快速读取授权成功；发送授权保持不变" + (string.IsNullOrWhiteSpace(result.UserEmail) ? "" : "：" + result.UserEmail);
                         _codePanel.Visibility = Visibility.Collapsed;
@@ -219,6 +220,7 @@ namespace MailPulse.UI
             AddLabel(g, r, "轮询间隔(秒)");
             _tbInterval = new TextBox { Text = "45", HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 3, 0, 3) };
             Theme.StyleTextBox(_tbInterval, 80);
+            _tbInterval.ToolTip = "POP3 / 不支持 IDLE 的 IMAP 使用此间隔；Graph 固定约 5 秒，支持 IDLE 的 IMAP 收到事件后立即检查。";
             Grid.SetRow(_tbInterval, r); Grid.SetColumn(_tbInterval, 1); g.Children.Add(_tbInterval); r++;
 
             // 启用复选框
@@ -270,7 +272,12 @@ namespace MailPulse.UI
                 _chkSsl.IsChecked = editing.UseSsl;
                 _tbUser.Text = editing.User ?? "";
                 _tbOAuthClientId.Text = editing.OAuthClientId ?? "";
-                _cbOAuthMode.SelectedIndex = string.IsNullOrWhiteSpace(editing.OAuthClientId) ? 0 : 1;
+                // Never migrate an existing token to a different client just by opening/saving.
+                _cbOAuthMode.SelectedIndex = !string.IsNullOrWhiteSpace(editing.OAuthClientId)
+                    ? (string.Equals(editing.OAuthClientId.Trim(), Services.MicrosoftOAuthService.DefaultClientId,
+                        StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    : (editing.UseOAuth && (!string.IsNullOrWhiteSpace(editing.EncryptedImapRefreshToken) ||
+                        !string.IsNullOrWhiteSpace(editing.EncryptedRefreshToken)) ? 2 : 0);
                 _tbSmtpHost.Text = string.IsNullOrWhiteSpace(editing.SmtpHost)
                     ? Models.AccountConfig.GuessSmtpHost(editing.Host, editing.User)
                     : editing.SmtpHost;
@@ -361,6 +368,23 @@ namespace MailPulse.UI
             _tbOAuthClientId.Visibility = visibility;
             if (_oauthClientIdLabel != null) _oauthClientIdLabel.Visibility = visibility;
             if (_oauthRegistrationButton != null) _oauthRegistrationButton.Visibility = visibility;
+            if (_oauthModeHint != null)
+                _oauthModeHint.Text = custom
+                    ? "使用自己的 Entra 公共客户端。填写客户端 ID 后登录；切换应用须重新授权。"
+                    : (_cbOAuthMode.SelectedIndex == 2
+                        ? "仅保留旧版读取兼容。重新授权可能被微软拒绝，推荐切换默认微软登录并重新授权。"
+                        : "使用 MailPulse 内置应用，无需注册 Entra。用你自己的微软个人邮箱登录，即可读取和发送邮件。");
+        }
+
+        private string GetRequestedOAuthClientId()
+        {
+            if (_cbOAuthMode.SelectedIndex == 0) return Services.MicrosoftOAuthService.DefaultClientId;
+            if (_cbOAuthMode.SelectedIndex == 2) return ""; // Explicit legacy mode only.
+            string clientId = _tbOAuthClientId.Text.Trim();
+            Guid parsed;
+            if (!Guid.TryParse(clientId, out parsed))
+                throw new InvalidOperationException("请填写有效的 Entra 应用客户端 ID，或选择默认微软登录。");
+            return clientId;
         }
 
         private void OnPresetChanged(object s, SelectionChangedEventArgs e)
