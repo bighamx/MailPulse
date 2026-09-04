@@ -141,4 +141,4 @@ dotnet build MailPulse.csproj -c Release
 
 
 
- [Linux.do社区](https://linux.do)
+![认可linux.do](https://ld.xh.do/ld-badge.svg)
